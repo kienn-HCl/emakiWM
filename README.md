@@ -1,4 +1,4 @@
-# emakiWM
+# emakiWM (WIP)
 
 niri 風のスクロール型タイリング WM for Windows。
 
