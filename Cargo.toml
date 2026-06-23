@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/emakiwm",
+    "crates/emakiwm-core",
+    "crates/emakiwmc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+emakiwm-core = { path = "crates/emakiwm-core" }
+windows = "0.62"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

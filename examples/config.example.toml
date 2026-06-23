@@ -1,0 +1,165 @@
+# emakiwm 設定ファイルの例
+#
+# 配置場所:   %USERPROFILE%\.config\emakiwm\config.toml
+#             (例: C:\Users\you\.config\emakiwm\config.toml)
+# 反映方法:   gap / anim_ms / hide / rules → `emakiwmc reload` で即反映
+#             keybinds                     → emakiwm の再起動が必要
+# 注意:       ファイルがない・壊れている場合はデフォルト値で起動する (起動は止まらない)
+
+# ─────────────────────────────────────────────
+# 基本
+# ─────────────────────────────────────────────
+
+# ウィンドウ間・画面端の隙間 (px)。0〜200。デフォルト 8
+gap = 8
+
+# レイアウト変化アニメーションの時間 (ms)。0 で無効。最大 2000。デフォルト 180
+anim_ms = 180
+
+# Viewport 外 (スクロールで画面外に出た列・非アクティブワークスペース) の隠し方:
+#   "offscreen" (デフォルト): モニタ外座標へ退避。Alt+Tab・タスクバーには残る
+#   "cloak":                  完全に隠す。Alt+Tab・タスクバーからも消える
+hide = "offscreen"
+
+# 新しく開いた Column の幅 (Viewport に対する比率)。0.1〜1.0。デフォルト 0.5
+#   0.5  : ちょうど 2 枚並ぶ
+#   0.48 : 2 枚 + 隣の列の端が少し見える (niri 風のチラ見え)
+#   0.33 : 3 枚並ぶ
+# 既存ウィンドウの幅は変わらない (新規分から適用。alt+r のプリセットは 1/3, 1/2, 2/3 固定)
+default_width_ratio = 0.5
+
+# ウィンドウ枠の色 (Win11)。OS ネイティブの枠線の色を変える。
+# 値: "#rrggbb" / "default" (OS 既定色) / "none" (枠線を消す)
+# 両方とも未指定なら枠色には一切触らない。`emakiwmc reload` で反映
+#border_focused = "#7aa2f7"      # フォーカス中のウィンドウ
+#border_unfocused = "default"    # それ以外の管理ウィンドウ
+
+# 太枠オーバーレイの太さ (px、0〜50)。0 (デフォルト) = OS 標準の細枠のみ。
+# 1 以上にすると画面内の管理ウィンドウ全部に太枠を描く (アニメーションにも追従):
+#   - フォーカス中:   border_focused の色
+#   - 非フォーカス:   border_unfocused の色
+# "#rrggbb" を指定したウィンドウだけが対象 ("default"/"none"/未指定なら太枠なし)。
+# 例: フォーカスのみ太枠 → border_focused だけ色指定
+#     全ウィンドウ太枠   → border_unfocused にも色指定
+# 注意: 太さは gap の半分以下を推奨 (超えると隣のタイルに枠が隠れることがある)
+#border_thickness = 3
+
+# 非フォーカスウィンドウの不透明度 (0.2〜1.0)。1.0 または未指定で無効。
+# フォーカスの当たっていない管理ウィンドウを半透明にする。`emakiwmc reload` で反映
+#unfocused_opacity = 0.9
+
+# toggle-opacity コマンドでピンしたウィンドウの不透明度 (0.2〜1.0)。デフォルト 1.0。
+# ピン中はフォーカスが外れてもこの値を維持する (動画を見ながら作業する用途など)
+#pinned_opacity = 1.0
+
+# 画面の余白 (px)。CSS 風に [上, 右, 下, 左]。省略形: [全辺] / [上下, 左右]。
+# AppBar 登録しないバー (Zebar 等) のぶんを空けるのに使う。
+# 解像度・タスクバーの変更には自動追従する。`emakiwmc reload` で反映
+#margin = [40, 0, 0, 0]
+
+# WebSocket 状態配信 (Zebar 等のステータスバー連携用)。未指定で無効。
+# ws://127.0.0.1:<port>/ へ接続すると、状態 JSON が接続時 + 変化時に push される
+# (examples/zebar/emakiwm-widget.html にサンプルウィジェットあり)。反映は再起動
+#ws_port = 6573
+
+# ─────────────────────────────────────────────
+# ウィンドウルール (FR-2.2)
+# ─────────────────────────────────────────────
+# exe / class / title は正規表現。指定したものすべてにマッチしたら適用 (AND)。
+# 複数ルールがある場合は最初にマッチしたものを適用。
+# action:
+#   "ignore" : 存在しないものとして扱う (タイルもしないし一覧にも出さない)
+#   "float"  : 位置を触らない (フローティング)
+#   "manage" : ヒューリスティックを無視して強制的にタイル管理する
+# 注意: 不可視・自プロセス・cloaked のウィンドウは manage でも管理できない (安全ガード)
+
+# 例: メモ帳は常にフローティング
+#[[rules]]
+#exe = "Notepad\\.exe"
+#action = "float"
+
+# 例: タイトルに「設定」を含む特定アプリのウィンドウを無視
+#[[rules]]
+#exe = "SomeApp\\.exe"
+#title = "設定"
+#action = "ignore"
+
+# 例: 既定では float になるウィンドウ (リサイズ不可など) を強制管理
+#[[rules]]
+#class = "SomeWindowClass"
+#action = "manage"
+
+# ─────────────────────────────────────────────
+# キーバインド (FR-6.3)
+# ─────────────────────────────────────────────
+# デフォルト表にマージされる (書いたものだけ上書き)。値を "none" にすると無効化。
+# 反映には emakiwm の再起動が必要。
+#
+# キー書式: "modifier+...+key" (modifier は必須。修飾なしのキーは奪わない)
+#   modifier : alt / ctrl (control) / shift / win (super)
+#   key      : a-z 0-9 / f1〜f24 / comma period minus slash semicolon /
+#              space enter tab esc backspace /
+#              left right up down pageup pagedown home end
+#
+# コマンド一覧 (emakiwmc・IPC と共通の構文):
+#   focus left|right|down|up    フォーカス移動 (上下端でワークスペース切替に続く)
+#   move-column left|right      Column の並べ替え
+#   move-window down|up         ウィンドウを下/上のワークスペースへ移動
+#   workspace down|up           ワークスペース切替
+#   scroll left|right           Viewport を 1 Column ぶんスクロール
+#   consume                     右隣の Tile を取り込んで縦スタック化
+#   expel                       Tile を右隣へ押し出して独立させる
+#   cycle-width                 Column 幅プリセット (1/3 → 1/2 → 2/3) をサイクル
+#   maximize                    maximize-column トグル (Viewport 全幅)
+#   fullscreen                  fullscreen トグル (モニタ全面)
+#   close                       フォーカスウィンドウを閉じる
+#   toggle-opacity              フォーカスウィンドウの opacity ピンをトグル
+#                               (ピン中は非フォーカスでも pinned_opacity を維持)
+#   spawn <コマンドライン>       アプリ起動 (例: spawn notepad / spawn wt -p NixOS)。
+#                               空白区切りで分割される (引用符は未対応)
+#   reload                      設定ファイル再読込
+#   quit                        emakiwm 終了 (全ウィンドウ復元)
+
+[keybinds]
+# ↓ デフォルトのキーバインド一覧 (変更したいものだけコメントを外して編集)
+#"alt+h" = "focus left"
+#"alt+l" = "focus right"
+#"alt+j" = "focus down"
+#"alt+k" = "focus up"
+#"alt+shift+h" = "move-column left"
+#"alt+shift+l" = "move-column right"
+#"alt+shift+j" = "move-window down"
+#"alt+shift+k" = "move-window up"
+#"alt+u" = "workspace down"
+#"alt+i" = "workspace up"
+#"alt+shift+comma" = "consume"
+#"alt+shift+period" = "expel"
+#"alt+r" = "cycle-width"
+#"alt+f" = "maximize"
+#"alt+shift+f" = "fullscreen"
+#"alt+comma" = "scroll left"
+#"alt+period" = "scroll right"
+#"alt+shift+q" = "close"
+#"alt+shift+e" = "quit"
+
+# 例: Alt+T に maximize、デフォルトの Alt+Shift+E (quit) を無効化
+#"alt+t" = "maximize"
+#"alt+shift+e" = "none"
+
+# 例: アプリ起動 (Alt+Enter でターミナル、Alt+B でブラウザ)
+#"alt+enter" = "spawn wt"
+#"alt+b" = "spawn firefox"
+
+# ─────────────────────────────────────────────
+# 既知の制約 (FR-6.4)
+# ─────────────────────────────────────────────
+# - 管理者権限のウィンドウがフォアグラウンドの間、ホットキーは発火しない (UIPI)。
+#   管理者ウィンドウ自体もタイル管理されない (untracked)
+# - Alt+Shift 系バインドは Windows のキーボードレイアウト切替 (Alt+Shift) と
+#   衝突することがある。設定 > 時刻と言語 > 入力 > キーボードの詳細設定 >
+#   入力言語のホットキー から切替ホットキーを無効化できる
+#
+# レスキューコマンド:
+#   emakiwm --restore      強制終了後、ウィンドウを記録位置へ戻す (state.json)
+#   emakiwm --uncloak-all  cloak されたまま取り残されたウィンドウを一括で戻す
+#   emakiwm --dry-run      管理対象判定の確認 (--verbose で除外理由も表示)

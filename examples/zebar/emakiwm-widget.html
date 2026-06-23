@@ -1,0 +1,90 @@
+<!doctype html>
+<!--
+  emakiwm 用 Zebar ウィジェットのサンプル (FR-7.5)。
+
+  前提: config.toml に `ws_port = 6573` を設定して emakiwm を起動しておく。
+  ワークスペースインジケータとフォーカス中ウィンドウのタイトルを表示し、
+  状態は WebSocket で push されるのでポーリング不要・即時反映。
+
+  Zebar への組み込み: このファイルをウィジェットとして登録する
+  (Zebar の設定ディレクトリへコピーし、widget の htmlPath に指定)。
+  ブラウザで直接開いても動くので、まずブラウザで表示確認すると楽。
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {
+    margin: 0;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 8px;
+    font: 12px "Segoe UI", sans-serif;
+    color: #c0caf5;
+    background: transparent;
+  }
+  #workspaces { display: flex; gap: 4px; }
+  #workspaces span {
+    min-width: 18px;
+    height: 18px;
+    line-height: 18px;
+    text-align: center;
+    border-radius: 4px;
+    background: #1a1b26aa;
+  }
+  #workspaces span.active {
+    background: #7aa2f7;
+    color: #1a1b26;
+    font-weight: bold;
+  }
+  #title {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 50vw;
+    opacity: 0.8;
+  }
+  #status { opacity: 0.4; }
+</style>
+</head>
+<body>
+  <div id="workspaces"></div>
+  <div id="title"></div>
+  <div id="status"></div>
+<script>
+const PORT = 6573; // config.toml の ws_port と合わせる
+
+function render(s) {
+  const ws = document.getElementById("workspaces");
+  ws.innerHTML = "";
+  s.workspaces.forEach((w, i) => {
+    const el = document.createElement("span");
+    el.textContent = i + 1;
+    if (i === s.active_workspace) el.classList.add("active");
+    ws.appendChild(el);
+  });
+  let title = "";
+  for (const w of s.workspaces)
+    for (const c of w.columns)
+      for (const t of c.tiles)
+        if (t.hwnd === s.focused) title = t.title;
+  document.getElementById("title").textContent = title;
+}
+
+function connect() {
+  const sock = new WebSocket(`ws://127.0.0.1:${PORT}/`);
+  sock.onopen = () => { document.getElementById("status").textContent = ""; };
+  sock.onmessage = (ev) => render(JSON.parse(ev.data));
+  // emakiwm の再起動に追従して自動再接続
+  sock.onclose = () => {
+    document.getElementById("status").textContent = "(emakiwm 未接続)";
+    setTimeout(connect, 1000);
+  };
+  sock.onerror = () => sock.close();
+}
+connect();
+</script>
+</body>
+</html>
