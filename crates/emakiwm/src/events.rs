@@ -4,6 +4,7 @@
 //! 受ける必要があるため、専用スレッドでフック登録 + GetMessageW ループを回し、
 //! 生イベントを mpsc チャネルで Core スレッドへ送る (§5 アーキテクチャ)。
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
@@ -12,13 +13,17 @@ use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, HOT_KEY_MODIFIERS};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, VK_LMENU, VK_MENU, VK_RMENU, HOT_KEY_MODIFIERS,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
+    RegisterClassW, SetWindowsHookExW, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, MSG, OBJID_WINDOW,
     EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
     EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, MSG, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_DISPLAYCHANGE, WM_HOTKEY, WM_SETTINGCHANGE, WNDCLASSW, WS_POPUP,
+    EVENT_SYSTEM_MINIMIZESTART, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_HOTKEY, WM_KEYDOWN, WM_MOUSEWHEEL,
+    WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
 };
 
 /// Core スレッドへ送るイベント。hwnd は isize (HWND は Send でないため)。
@@ -148,6 +153,19 @@ pub fn sender() -> Option<&'static Sender<WmEvent>> {
     SENDER.get()
 }
 
+/// Alt+ホイールフォーカス移動の有効/無効。reload で切り替え可能
+static MOUSE_SCROLL_FOCUS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_mouse_scroll_focus(enabled: bool) {
+    MOUSE_SCROLL_FOCUS.store(enabled, Ordering::Relaxed);
+}
+
+/// Alt 押下の最終 tick (KBDLLHOOKSTRUCT.time, ms 単位)。
+/// keydown で更新、keyup で ALT_UP_TICK が更新される。
+/// 初期値 0 / 1 にすることで「up が down より新しい」→ 非押下状態とする。
+static ALT_DOWN_TICK: AtomicU32 = AtomicU32::new(0);
+static ALT_UP_TICK: AtomicU32 = AtomicU32::new(1);
+
 /// フックスレッドを起動する。プロセス終了までフックは張りっぱなしでよい
 /// (フックはプロセス終了時に OS が解除する)。
 /// キーバインドの変更はプロセス再起動が必要 (フックスレッドで登録するため)。
@@ -183,7 +201,7 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>) {
             ..Default::default()
         };
         if RegisterClassW(&wc) != 0 {
-            let _ = CreateWindowExW(
+            if let Ok(hwnd) = CreateWindowExW(
                 Default::default(),
                 w!("emakiwm_events"),
                 w!(""),
@@ -196,7 +214,9 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>) {
                 None,
                 Some(instance.into()),
                 None,
-            );
+            ) {
+                crate::tray::setup(hwnd);
+            }
         }
 
         // FR-6.1: ホットキーはメッセージループを持つこのスレッドで登録する。
@@ -215,6 +235,21 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>) {
                     hk.vk
                 );
             }
+        }
+
+        // Alt 状態を自前追跡するキーボードフック。
+        // タッチパッドドライバが Alt を解放してから WM_MOUSEWHEEL を送る場合に備え、
+        // GetAsyncKeyState に頼らず KEYDOWN/KEYUP で明示的に管理する。
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), Some(instance.into()), 0) {
+            Ok(h) if !h.is_invalid() => tracing::debug!("WH_KEYBOARD_LL registered"),
+            _ => tracing::warn!("WH_KEYBOARD_LL の登録に失敗しました"),
+        }
+        // Alt+ホイールフォーカス移動用グローバルマウスフック。
+        // 常に登録し、コールバック内の AtomicBool で on/off を制御する。
+        // WH_MOUSE_LL は hook thread のメッセージポンプで呼ばれる。
+        match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), Some(instance.into()), 0) {
+            Ok(h) if !h.is_invalid() => tracing::debug!("WH_MOUSE_LL registered"),
+            _ => tracing::warn!("WH_MOUSE_LL の登録に失敗しました"),
         }
 
         let mut msg = MSG::default();
@@ -249,6 +284,10 @@ unsafe extern "system" fn settings_wnd_proc(
             }
             LRESULT(0)
         }
+        _ if crate::tray::is_tray_message(msg) => {
+            crate::tray::handle_message(hwnd, msg, lp);
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
@@ -280,4 +319,56 @@ unsafe extern "system" fn win_event_proc(
     if let Some(tx) = SENDER.get() {
         let _ = tx.send(ev);
     }
+}
+
+/// WH_MOUSE_LL コールバック。Alt+ホイールをフォーカス移動へ変換する。
+/// LowLevelHooksTimeout (既定 ~300ms) 以内に返す必要があるため、
+/// tx.send() のみ行い重い処理は絶対にしない。
+/// WH_KEYBOARD_LL: Alt キーの押下/解放タイムスタンプを記録するだけで
+/// イベントは必ず通過させる (consume しない)。
+/// キーリピートで SYSKEYDOWN が繰り返し届くため、長押し中は ALT_DOWN_TICK が更新され続ける。
+unsafe extern "system" fn keyboard_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let ks = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+        let vk = ks.vkCode;
+        if vk == VK_MENU.0 as u32 || vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32 {
+            if matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                ALT_DOWN_TICK.store(ks.time, Ordering::Relaxed);
+            } else {
+                ALT_UP_TICK.store(ks.time, Ordering::Relaxed);
+            }
+        }
+    }
+    CallNextHookEx(None, code, wp, lp)
+}
+
+/// WH_MOUSE_LL: タイムスタンプ比較で Alt 押下を判定しフォーカス移動へ変換する。
+///
+/// 判定ロジック:
+///   - last_down > last_up (循環比較) かつ スクロール時刻 - last_down < 1500ms
+/// これにより:
+///   - GetAsyncKeyState に依存しない → タッチパッドドライバの干渉を受けない
+///   - keyup をドライバに消費された場合でも 1.5s 後に自動解消 (刺さり防止)
+///   - キーリピートで last_down が更新されるため長押し中は制限なく動作する
+unsafe extern "system" fn mouse_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 && wp.0 as u32 == WM_MOUSEWHEEL && MOUSE_SCROLL_FOCUS.load(Ordering::Relaxed) {
+        let ms = &*(lp.0 as *const MSLLHOOKSTRUCT);
+        let now = ms.time;
+        let down = ALT_DOWN_TICK.load(Ordering::Relaxed);
+        let up = ALT_UP_TICK.load(Ordering::Relaxed);
+        // 循環タイムスタンプで「down が up より新しい」かつ「1.5s 以内」を確認
+        let down_is_newer = down.wrapping_sub(up) < u32::MAX / 2;
+        let within_window = now.wrapping_sub(down) < 1500;
+        let alt_down = down_is_newer && within_window;
+        tracing::trace!("mouse_ll: WM_MOUSEWHEEL alt={alt_down}");
+        if alt_down {
+            let delta = (ms.mouseData >> 16) as i16;
+            let dir = if delta > 0 { FocusDir::Right } else { FocusDir::Left };
+            if let Some(tx) = SENDER.get() {
+                let _ = tx.send(WmEvent::Focus(dir));
+            }
+            return LRESULT(1);
+        }
+    }
+    CallNextHookEx(None, code, wp, lp)
 }

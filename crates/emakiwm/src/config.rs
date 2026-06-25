@@ -46,6 +46,7 @@ const DEFAULT_BINDS: &[(&str, &str)] = &[
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct ConfigFile {
+    startup: Vec<String>,
     gap: Option<i32>,
     anim_ms: Option<u64>,
     /// Viewport 外の隠蔽方式 (FR-3.3): "offscreen" (デフォルト) | "cloak"
@@ -68,6 +69,8 @@ struct ConfigFile {
     margin: Option<Vec<i32>>,
     /// WebSocket 状態配信のポート (FR-7.5)。未指定で無効
     ws_port: Option<u16>,
+    /// Alt+ホイールでフォーカス左右移動。デフォルト false
+    mouse_scroll_focus: Option<bool>,
     rules: Vec<RuleEntry>,
     keybinds: BTreeMap<String, String>,
 }
@@ -81,6 +84,8 @@ struct RuleEntry {
 }
 
 pub struct Config {
+    /// WM 起動時に自動実行するコマンド一覧。run() 初回のみ、reload では走らない
+    pub startup: Vec<String>,
     pub gap: i32,
     /// 0 でアニメーション無効 (FR-4.8)
     pub anim: Duration,
@@ -102,6 +107,8 @@ pub struct Config {
     pub margin: (i32, i32, i32, i32),
     /// WebSocket 状態配信のポート (FR-7.5)。None = 無効。反映は再起動
     pub ws_port: Option<u16>,
+    /// Alt+ホイールでフォーカス左右移動。reload で反映
+    pub mouse_scroll_focus: bool,
     pub rules: Vec<Rule>,
     pub hotkeys: Vec<Hotkey>,
 }
@@ -190,6 +197,7 @@ pub fn load() -> Config {
     };
 
     Config {
+        startup: file.startup,
         gap: file.gap.unwrap_or(8).clamp(0, 200),
         anim: Duration::from_millis(file.anim_ms.unwrap_or(180).min(2000)),
         cloak,
@@ -206,6 +214,7 @@ pub fn load() -> Config {
             .map_or(255, |r| (r.clamp(0.2, 1.0) * 255.0) as u8),
         margin: parse_margin(file.margin.as_deref()),
         ws_port: file.ws_port,
+        mouse_scroll_focus: file.mouse_scroll_focus.unwrap_or(false),
         rules,
         hotkeys,
     }

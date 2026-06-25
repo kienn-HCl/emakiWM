@@ -42,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::events::{self, WmEvent};
-use crate::{border, com, config, ipc, scan, ws};
+use crate::{border, com, config, ipc, scan, tray, ws};
 
 /// アニメーション中のフレーム間隔。
 const FRAME: Duration = Duration::from_millis(8);
@@ -74,6 +74,7 @@ pub fn run() {
     install_restore_hooks();
 
     let mut cfg = config::load();
+    events::set_mouse_scroll_focus(cfg.mouse_scroll_focus);
 
     let (tx, rx) = mpsc::channel::<WmEvent>();
     events::spawn_hook_thread(tx.clone(), cfg.hotkeys.clone());
@@ -137,6 +138,18 @@ pub fn run() {
     }
 
     persist_restore_rects();
+
+    // startup: 初期スキャン完了後に設定されたアプリを起動する。
+    // 起動したウィンドウは Appeared イベントで通常通り取り込まれる
+    for cmd in &cfg.startup {
+        let mut parts = cmd.split_whitespace();
+        if let Some(prog) = parts.next() {
+            match std::process::Command::new(prog).args(parts).spawn() {
+                Ok(_) => tracing::info!("startup: {cmd}"),
+                Err(e) => tracing::warn!("startup \"{cmd}\" failed: {e}"),
+            }
+        }
+    }
 
     let fg = WindowId(unsafe { GetForegroundWindow() }.0 as u64);
     if stack.contains(fg) {
@@ -367,6 +380,7 @@ pub fn run() {
                     // FR-7.2: gap / anim / rules / hide / reserve を反映。
                     // キーバインドは再起動が必要
                     cfg = config::load();
+                    events::set_mouse_scroll_focus(cfg.mouse_scroll_focus);
                     (work, monitor) = effective_work(&cfg);
                     viewport_w = work.w - 2 * cfg.gap;
                     default_width = ((viewport_w - cfg.gap) as f32 * cfg.default_ratio) as i32;
@@ -1276,6 +1290,7 @@ fn install_restore_hooks() {
 /// panic 後の poisoned lock でも復元を諦めない (NFR-4)。
 /// 正常に復元できたら state.json は不要なので消す (FR-1.6)。
 fn restore_all() {
+    tray::remove();
     uncloak_all();
     undim_all();
     let mut guard = RESTORE_RECTS
