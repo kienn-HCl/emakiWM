@@ -41,6 +41,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "emakiwm-setup"
+version = "0.1.0"
+dependencies = [
+ "embed-manifest",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "emakiwmc"
 version = "0.1.0"
 

@@ -4,6 +4,7 @@ members = [
     "crates/emakiwm",
     "crates/emakiwm-core",
     "crates/emakiwmc",
+    "crates/emakiwm-setup",
 ]
 
 [workspace.package]
