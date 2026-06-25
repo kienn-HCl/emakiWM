@@ -71,7 +71,9 @@ pub fn show_main_menu() -> MainMenuResult {
 /// インストールオプションダイアログを表示する。
 /// フォルダ変更ボタンを押すたびに IFileOpenDialog を開いてループする。
 pub fn show_install_dialog() -> Option<InstallOptions> {
-    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    // S_OK/S_FALSE = refcount 増加 → CoUninitialize 必須。
+    // RPC_E_CHANGED_MODE 等のエラーは refcount 増加なし → CoUninitialize 不要。
+    let com_init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
     let mut install_dir = default_install_dir();
 
@@ -114,7 +116,7 @@ pub fn show_install_dialog() -> Option<InstallOptions> {
             }
             1 => break, // IDOK
             _ => {
-                unsafe { CoUninitialize() };
+                if com_init.is_ok() { unsafe { CoUninitialize() }; }
                 return None;
             }
         }
@@ -157,7 +159,7 @@ pub fn show_install_dialog() -> Option<InstallOptions> {
     }
     .ok();
 
-    unsafe { CoUninitialize() };
+    if com_init.is_ok() { unsafe { CoUninitialize() }; }
 
     match result_btn {
         BTN_LAUNCH | BTN_NO_LAUNCH => Some(InstallOptions {

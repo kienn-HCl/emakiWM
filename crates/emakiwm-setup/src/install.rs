@@ -83,14 +83,8 @@ pub fn install(opts: &InstallOptions) -> std::io::Result<()> {
 
 /// アンインストールを実行する。
 pub fn uninstall(opts: &UninstallOptions) -> std::io::Result<()> {
-    let install_dir = match read_install_dir() {
-        Some(p) => p,
-        None => {
-            return Err(std::io::Error::other(
-                "インストール先をレジストリから取得できませんでした",
-            ))
-        }
-    };
+    // Uninstall キーが消えていても default_install_dir にフォールバックしてクリーンアップする
+    let install_dir = read_install_dir().unwrap_or_else(default_install_dir);
 
     // スタートアップ解除
     set_autostart_for_exe(&install_dir.join("emakiwm.exe"), false);
@@ -245,7 +239,10 @@ fn unregister_uninstall() {
 
 // ─── Autostart ───────────────────────────────────────────────────────────────
 
+// emakiwm::autostart::set_autostart_for_exe と同等の処理。
+// emakiwm-setup は emakiwm クレートに依存できないため複製している。
 fn set_autostart_for_exe(exe: &Path, enable: bool) {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     const RUN_SUBKEY: PCWSTR =
         w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     const VALUE_NAME: PCWSTR = w!("emakiwm");
@@ -258,7 +255,9 @@ fn set_autostart_for_exe(exe: &Path, enable: bool) {
         let value = format!("\"{}\"", exe.display());
         write_reg_sz(hkey, VALUE_NAME, &value);
     } else {
-        unsafe { let _ = RegDeleteValueW(hkey, VALUE_NAME); };
+        let err = unsafe { RegDeleteValueW(hkey, VALUE_NAME) };
+        // 値が存在しない場合は正常 (ERROR_FILE_NOT_FOUND を無視)
+        let _ = err != ERROR_SUCCESS && err != ERROR_FILE_NOT_FOUND;
     }
     unsafe { let _ = RegCloseKey(hkey); };
 }
@@ -272,7 +271,7 @@ fn schedule_self_delete(setup_exe: &Path, install_dir: &Path) {
     let setup = setup_exe.display();
     let dir = install_dir.display();
     let content = format!(
-        "@echo off\r\ntimeout /t 2 /nobreak > nul\r\ndel /f /q \"{setup}\"\r\nrmdir /q \"{dir}\"\r\ndel /f /q \"%~f0\"\r\n"
+        "@echo off\r\ntimeout /t 2 /nobreak > nul\r\ndel /f /q \"{setup}\"\r\nrmdir /s /q \"{dir}\"\r\ndel /f /q \"%~f0\"\r\n"
     );
     if std::fs::write(&bat, content).is_ok() {
         let _ = std::process::Command::new("cmd")
@@ -329,9 +328,9 @@ fn shortcut_path() -> PathBuf {
 }
 
 fn create_start_menu_shortcut(install_dir: &Path) {
-    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let com_init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     unsafe { try_create_shortcut(install_dir) };
-    unsafe { CoUninitialize() };
+    if com_init.is_ok() { unsafe { CoUninitialize() }; }
 }
 
 unsafe fn try_create_shortcut(install_dir: &Path) {
