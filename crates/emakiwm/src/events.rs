@@ -169,7 +169,9 @@ static ALT_UP_TICK: AtomicU32 = AtomicU32::new(1);
 /// フックスレッドを起動する。プロセス終了までフックは張りっぱなしでよい
 /// (フックはプロセス終了時に OS が解除する)。
 /// キーバインドの変更はプロセス再起動が必要 (フックスレッドで登録するため)。
-pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>) {
+/// mouse_scroll_focus が false のときは WH_KEYBOARD_LL / WH_MOUSE_LL を登録しない
+/// (不要なグローバルフックはセキュリティソフトの誤検出を招くため)。
+pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>, mouse_scroll_focus: bool) {
     SENDER.set(tx).expect("hook thread spawned twice");
 
     std::thread::spawn(move || unsafe {
@@ -237,19 +239,18 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>) {
             }
         }
 
-        // Alt 状態を自前追跡するキーボードフック。
-        // タッチパッドドライバが Alt を解放してから WM_MOUSEWHEEL を送る場合に備え、
-        // GetAsyncKeyState に頼らず KEYDOWN/KEYUP で明示的に管理する。
-        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), Some(instance.into()), 0) {
-            Ok(h) if !h.is_invalid() => tracing::debug!("WH_KEYBOARD_LL registered"),
-            _ => tracing::warn!("WH_KEYBOARD_LL の登録に失敗しました"),
-        }
-        // Alt+ホイールフォーカス移動用グローバルマウスフック。
-        // 常に登録し、コールバック内の AtomicBool で on/off を制御する。
-        // WH_MOUSE_LL は hook thread のメッセージポンプで呼ばれる。
-        match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), Some(instance.into()), 0) {
-            Ok(h) if !h.is_invalid() => tracing::debug!("WH_MOUSE_LL registered"),
-            _ => tracing::warn!("WH_MOUSE_LL の登録に失敗しました"),
+        // mouse_scroll_focus が有効なときのみグローバル入力フックを登録する。
+        // WH_KEYBOARD_LL / WH_MOUSE_LL は正当な用途でもセキュリティソフトに
+        // キーロガーとして誤検出されやすいため、必要なときだけ登録する。
+        if mouse_scroll_focus {
+            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), Some(instance.into()), 0) {
+                Ok(h) if !h.is_invalid() => tracing::debug!("WH_KEYBOARD_LL registered"),
+                _ => tracing::warn!("WH_KEYBOARD_LL の登録に失敗しました"),
+            }
+            match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), Some(instance.into()), 0) {
+                Ok(h) if !h.is_invalid() => tracing::debug!("WH_MOUSE_LL registered"),
+                _ => tracing::warn!("WH_MOUSE_LL の登録に失敗しました"),
+            }
         }
 
         let mut msg = MSG::default();
