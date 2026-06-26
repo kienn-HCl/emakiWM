@@ -116,8 +116,9 @@ pub fn uninstall(opts: &UninstallOptions) -> std::io::Result<()> {
         let _ = std::fs::remove_file(install_dir.join(name));
     }
 
-    // setup.exe 自身は次回起動時に削除（MoveFileEx でスケジュール）
-    schedule_self_delete(&install_dir.join("emakiwm-setup.exe"), &install_dir);
+    // setup.exe 自身と空になったディレクトリを次回再起動時に削除
+    schedule_delete_on_reboot(&install_dir.join("emakiwm-setup.exe"));
+    schedule_delete_on_reboot(&install_dir);
 
     Ok(())
 }
@@ -262,21 +263,22 @@ fn set_autostart_for_exe(exe: &Path, enable: bool) {
     unsafe { let _ = RegCloseKey(hkey); };
 }
 
-// ─── setup.exe 自身の削除スケジュール ────────────────────────────────────────
+// ─── 再起動時削除スケジュール ────────────────────────────────────────────────
 
-fn schedule_self_delete(setup_exe: &Path, install_dir: &Path) {
-    // バッチファイルを TEMP に作成して非同期実行する古典的手法
-    let Ok(temp) = std::env::var("TEMP") else { return };
-    let bat = PathBuf::from(temp).join("emakiwm_uninstall.bat");
-    let setup = setup_exe.display();
-    let dir = install_dir.display();
-    let content = format!(
-        "@echo off\r\ntimeout /t 2 /nobreak > nul\r\ndel /f /q \"{setup}\"\r\nrmdir /s /q \"{dir}\"\r\ndel /f /q \"%~f0\"\r\n"
-    );
-    if std::fs::write(&bat, content).is_ok() {
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "/min", "", bat.to_str().unwrap_or("")])
-            .spawn();
+/// MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT) でパスを次回再起動時に削除登録する。
+/// バッチファイル方式より安全で、セキュリティソフトに誤検出されにくい。
+fn schedule_delete_on_reboot(path: &Path) {
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    let path_w: Vec<u16> = path.to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = MoveFileExW(
+            PCWSTR(path_w.as_ptr()),
+            PCWSTR(std::ptr::null()),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        );
     }
 }
 
