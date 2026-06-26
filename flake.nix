@@ -7,9 +7,13 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    naersk = {
+      url = "github:nix-community/naersk";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay }:
+  outputs = { self, nixpkgs, rust-overlay, naersk }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -17,33 +21,58 @@
         overlays = [ rust-overlay.overlays.default ];
       };
 
-      # Windows 用 std を含む stable toolchain。
-      # ホスト (Linux) 向け std も含むため、core クレートの
-      # 純粋ロジックの cargo test は Linux 上でそのまま実行できる。
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         targets = [ "x86_64-pc-windows-gnu" ];
         extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
       };
 
       mingwCC = pkgs.pkgsCross.mingwW64.buildPackages.gcc;
-      # rust std (windows-gnu) が -l:libpthread.a を要求するため winpthreads が必要
       winpthreads = pkgs.pkgsCross.mingwW64.windows.pthreads;
+
+      naerskWin = (pkgs.callPackage naersk { }).override {
+        cargo = rustToolchain;
+        rustc = rustToolchain;
+      };
+
+      crossArgs = {
+        strictDeps = true;
+        depsBuildBuild = [ mingwCC ];
+        CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu";
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER =
+          "${mingwCC}/bin/x86_64-w64-mingw32-gcc";
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS =
+          "-L native=${winpthreads}/lib";
+        doCheck = false;
+      };
+
     in
     {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [
-          rustToolchain
-          mingwCC
-        ];
+      # nix build          → result/bin/ に全バイナリ (.exe)
+      # nix build .#emakiwm 等で個別指定も可
+      packages.${system} = {
+        default = naerskWin.buildPackage (crossArgs // { src = ./.; });
+        emakiwm = naerskWin.buildPackage (crossArgs // {
+          src = ./.;
+          cargoBuildOptions = opts: opts ++ [ "-p" "emakiwm" ];
+        });
+        emakiwmc = naerskWin.buildPackage (crossArgs // {
+          src = ./.;
+          cargoBuildOptions = opts: opts ++ [ "-p" "emakiwmc" ];
+        });
+        emakiwm-setup = naerskWin.buildPackage (crossArgs // {
+          src = ./.;
+          cargoBuildOptions = opts: opts ++ [ "-p" "emakiwm-setup" ];
+        });
+      };
 
-        # .exe のリンクに mingw-w64 gcc を使う
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [ rustToolchain mingwCC ];
+
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER =
           "${mingwCC}/bin/x86_64-w64-mingw32-gcc";
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS =
           "-L native=${winpthreads}/lib";
 
-        # WSL2 では binfmt interop により .exe を直接実行できるため、
-        # `cargo run --target x86_64-pc-windows-gnu` がそのまま動く
         shellHook = ''
           echo "emakiwm dev shell"
           echo "  build:  cargo build --target x86_64-pc-windows-gnu"
