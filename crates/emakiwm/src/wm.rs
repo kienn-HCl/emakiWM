@@ -34,11 +34,12 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetForegroundWindow,
     GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindow,
     PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-    GWL_EXSTYLE, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WS_EX_LAYERED,
+    GWL_EXSTYLE, LWA_ALPHA, SW_SHOWDEFAULT, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WS_EX_LAYERED,
 };
 
 use crate::events::{self, WmEvent};
@@ -142,13 +143,7 @@ pub fn run() {
     // startup: 初期スキャン完了後に設定されたアプリを起動する。
     // 起動したウィンドウは Appeared イベントで通常通り取り込まれる
     for cmd in &cfg.startup {
-        let mut parts = cmd.split_whitespace();
-        if let Some(prog) = parts.next() {
-            match std::process::Command::new(prog).args(parts).spawn() {
-                Ok(_) => tracing::info!("startup: {cmd}"),
-                Err(e) => tracing::warn!("startup \"{cmd}\" failed: {e}"),
-            }
-        }
+        shell_spawn(cmd);
     }
 
     let fg = WindowId(unsafe { GetForegroundWindow() }.0 as u64);
@@ -355,15 +350,7 @@ pub fn run() {
                     }
                 }
                 WmEvent::Spawn(cmd) => {
-                    // 空白区切りの素朴な分割 (空白を含むパスの引用符には未対応)。
-                    // 起動したアプリのウィンドウは Appeared イベントで取り込まれる
-                    let mut parts = cmd.split_whitespace();
-                    if let Some(prog) = parts.next() {
-                        match std::process::Command::new(prog).args(parts).spawn() {
-                            Ok(_) => tracing::info!("spawn: {cmd}"),
-                            Err(e) => tracing::warn!("spawn \"{cmd}\" failed: {e}"),
-                        }
-                    }
+                    shell_spawn(&cmd);
                 }
                 WmEvent::ToggleOpacity => {
                     // FR-3.8: フォーカスウィンドウの opacity ピンをトグル。
@@ -1321,4 +1308,37 @@ fn restore_all() {
     }
     let _ = std::fs::remove_file(state_path());
     tracing::info!("restored {} windows", map.len());
+}
+
+/// ShellExecuteW でアプリを起動する。
+/// CreateProcess と違い App Execution Alias (UWP 含む) や App Paths レジストリを
+/// 解決するため、スタートメニュー等から起動した場合でも wt などが正しく動く。
+fn shell_spawn(cmd: &str) {
+    let mut parts = cmd.split_whitespace();
+    let Some(prog) = parts.next() else { return };
+    let args: String = parts.collect::<Vec<_>>().join(" ");
+
+    let prog_w: Vec<u16> = prog.encode_utf16().chain(std::iter::once(0)).collect();
+    let args_w: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::PCWSTR(std::ptr::null()),
+            windows::core::PCWSTR(prog_w.as_ptr()),
+            if args.is_empty() {
+                windows::core::PCWSTR(std::ptr::null())
+            } else {
+                windows::core::PCWSTR(args_w.as_ptr())
+            },
+            windows::core::PCWSTR(std::ptr::null()),
+            SW_SHOWDEFAULT,
+        )
+    };
+
+    if result.0 as isize > 32 {
+        tracing::info!("spawn: {cmd}");
+    } else {
+        tracing::warn!("spawn \"{cmd}\" failed (ShellExecuteW={})", result.0 as isize);
+    }
 }
