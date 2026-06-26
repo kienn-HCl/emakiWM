@@ -2,6 +2,8 @@
 
 niri 風のスクロール型タイリング WM for Windows。
 
+<video src="assets/demo.mp4" controls width="100%"></video>
+
 Windows 上で [niri](https://github.com/YaLTeR/niri) の「スクロール型タイリング」レイアウトを再現する。DWM を置換するのではなく、既存ウィンドウを外部から操作するオーバーレイ型 WM として動作する。
 
 ## 特徴
