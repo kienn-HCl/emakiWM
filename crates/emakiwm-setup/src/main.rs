@@ -27,7 +27,9 @@ fn main() {
 #[cfg(windows)]
 fn attach_console() {
     use windows::Win32::System::Console::AttachConsole;
-    unsafe { let _ = AttachConsole(u32::MAX); };
+    unsafe {
+        let _ = AttachConsole(u32::MAX);
+    };
 }
 
 #[cfg(windows)]
@@ -52,7 +54,11 @@ fn run(args: &[String]) {
         let autostart = !args.iter().any(|a| a == "--no-autostart");
         let launch_now = !args.iter().any(|a| a == "--no-launch");
 
-        match install(&InstallOptions { install_dir: dir.clone(), autostart, launch_now }) {
+        match install(&InstallOptions {
+            install_dir: dir.clone(),
+            autostart,
+            launch_now,
+        }) {
             Ok(()) => {
                 println!("インストール完了: {}", dir.display());
                 if launch_now {
@@ -71,7 +77,9 @@ fn run(args: &[String]) {
         // CLI アンインストール
         let keep_config = args.iter().any(|a| a == "--keep-config");
         let quiet = args.iter().any(|a| a == "--quiet");
-        let opts = UninstallOptions { delete_config: !keep_config };
+        let opts = UninstallOptions {
+            delete_config: !keep_config,
+        };
 
         match uninstall(&opts) {
             Ok(()) => {

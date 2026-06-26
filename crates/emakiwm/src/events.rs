@@ -14,16 +14,15 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, VK_LMENU, VK_MENU, VK_RMENU, HOT_KEY_MODIFIERS,
+    RegisterHotKey, HOT_KEY_MODIFIERS, VK_LMENU, VK_MENU, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    RegisterClassW, SetWindowsHookExW, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, MSG, OBJID_WINDOW,
-    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
-    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_HOTKEY, WM_KEYDOWN, WM_MOUSEWHEEL,
-    WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+    SetWindowsHookExW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_HOTKEY,
+    WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
 };
 
 /// Core スレッドへ送るイベント。hwnd は isize (HWND は Send でないため)。
@@ -243,7 +242,12 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>, mouse_scroll
         // WH_KEYBOARD_LL / WH_MOUSE_LL は正当な用途でもセキュリティソフトに
         // キーロガーとして誤検出されやすいため、必要なときだけ登録する。
         if mouse_scroll_focus {
-            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), Some(instance.into()), 0) {
+            match SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_ll_proc),
+                Some(instance.into()),
+                0,
+            ) {
                 Ok(h) if !h.is_invalid() => tracing::debug!("WH_KEYBOARD_LL registered"),
                 _ => tracing::warn!("WH_KEYBOARD_LL の登録に失敗しました"),
             }
@@ -365,7 +369,11 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
         tracing::trace!("mouse_ll: WM_MOUSEWHEEL alt={alt_down}");
         if alt_down {
             let delta = (ms.mouseData >> 16) as i16;
-            let dir = if delta > 0 { FocusDir::Right } else { FocusDir::Left };
+            let dir = if delta > 0 {
+                FocusDir::Right
+            } else {
+                FocusDir::Left
+            };
             if let Some(tx) = SENDER.get() {
                 let _ = tx.send(WmEvent::Focus(dir));
             }

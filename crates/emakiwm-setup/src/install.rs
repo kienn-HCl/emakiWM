@@ -9,9 +9,8 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyW, RegDeleteKeyW, RegDeleteValueW, RegOpenKeyExW,
-    RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+    RegCloseKey, RegCreateKeyW, RegDeleteKeyW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
 };
 use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -149,13 +148,17 @@ pub fn read_install_dir() -> Option<PathBuf> {
         return None;
     }
     let value = read_reg_sz(hkey, w!("InstallLocation"));
-    unsafe { let _ = RegCloseKey(hkey); };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    };
     value.map(PathBuf::from)
 }
 
 pub fn default_install_dir() -> PathBuf {
     let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(local_appdata).join("Programs").join("emakiwm")
+    PathBuf::from(local_appdata)
+        .join("Programs")
+        .join("emakiwm")
 }
 
 // ─── PATH 操作 ────────────────────────────────────────────────────────────────
@@ -163,23 +166,49 @@ pub fn default_install_dir() -> PathBuf {
 fn add_to_path(dir: &Path) {
     let dir_str = dir.to_string_lossy().to_string();
     let mut hkey = HKEY::default();
-    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, ENV_SUBKEY, None, KEY_SET_VALUE | KEY_QUERY_VALUE, &mut hkey) } != ERROR_SUCCESS {
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            ENV_SUBKEY,
+            None,
+            KEY_SET_VALUE | KEY_QUERY_VALUE,
+            &mut hkey,
+        )
+    } != ERROR_SUCCESS
+    {
         return;
     }
     let current = read_reg_sz(hkey, PATH_VALUE).unwrap_or_default();
-    let already = current.split(';').any(|p| p.trim_end_matches('\\') == dir_str.trim_end_matches('\\'));
+    let already = current
+        .split(';')
+        .any(|p| p.trim_end_matches('\\') == dir_str.trim_end_matches('\\'));
     if !already {
-        let new_path = if current.is_empty() { dir_str.clone() } else { format!("{current};{dir_str}") };
+        let new_path = if current.is_empty() {
+            dir_str.clone()
+        } else {
+            format!("{current};{dir_str}")
+        };
         write_reg_sz(hkey, PATH_VALUE, &new_path);
     }
-    unsafe { let _ = RegCloseKey(hkey); };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    };
     broadcast_env_change();
 }
 
 fn remove_from_path(dir: &Path) {
     let dir_str = dir.to_string_lossy().to_string();
     let mut hkey = HKEY::default();
-    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, ENV_SUBKEY, None, KEY_SET_VALUE | KEY_QUERY_VALUE, &mut hkey) } != ERROR_SUCCESS {
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            ENV_SUBKEY,
+            None,
+            KEY_SET_VALUE | KEY_QUERY_VALUE,
+            &mut hkey,
+        )
+    } != ERROR_SUCCESS
+    {
         return;
     }
     if let Some(current) = read_reg_sz(hkey, PATH_VALUE) {
@@ -189,7 +218,9 @@ fn remove_from_path(dir: &Path) {
             .collect();
         write_reg_sz(hkey, PATH_VALUE, &new_path.join(";"));
     }
-    unsafe { let _ = RegCloseKey(hkey); };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    };
     broadcast_env_change();
 }
 
@@ -234,18 +265,26 @@ fn register_uninstall(install_dir: &Path) {
     write_reg_dword(hkey, w!("NoRepair"), 1);
 
     // インストールサイズ (KB)
-    let size_kb: u32 = REQUIRED.iter().chain(OPTIONAL.iter()).map(|name| {
-        std::fs::metadata(install_dir.join(name))
-            .map(|m| (m.len() / 1024) as u32)
-            .unwrap_or(0)
-    }).sum();
+    let size_kb: u32 = REQUIRED
+        .iter()
+        .chain(OPTIONAL.iter())
+        .map(|name| {
+            std::fs::metadata(install_dir.join(name))
+                .map(|m| (m.len() / 1024) as u32)
+                .unwrap_or(0)
+        })
+        .sum();
     write_reg_dword(hkey, w!("EstimatedSize"), size_kb);
 
-    unsafe { let _ = RegCloseKey(hkey); };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    };
 }
 
 fn unregister_uninstall() {
-    unsafe { let _ = RegDeleteKeyW(HKEY_CURRENT_USER, UNINSTALL_SUBKEY); };
+    unsafe {
+        let _ = RegDeleteKeyW(HKEY_CURRENT_USER, UNINSTALL_SUBKEY);
+    };
 }
 
 // ─── Autostart ───────────────────────────────────────────────────────────────
@@ -254,12 +293,20 @@ fn unregister_uninstall() {
 // emakiwm-setup は emakiwm クレートに依存できないため複製している。
 fn set_autostart_for_exe(exe: &Path, enable: bool) {
     use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
-    const RUN_SUBKEY: PCWSTR =
-        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     const VALUE_NAME: PCWSTR = w!("emakiwm");
 
     let mut hkey = HKEY::default();
-    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, RUN_SUBKEY, None, KEY_SET_VALUE, &mut hkey) } != ERROR_SUCCESS {
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            RUN_SUBKEY,
+            None,
+            KEY_SET_VALUE,
+            &mut hkey,
+        )
+    } != ERROR_SUCCESS
+    {
         return;
     }
     if enable {
@@ -270,7 +317,9 @@ fn set_autostart_for_exe(exe: &Path, enable: bool) {
         // 値が存在しない場合は正常 (ERROR_FILE_NOT_FOUND を無視)
         let _ = err != ERROR_SUCCESS && err != ERROR_FILE_NOT_FOUND;
     }
-    unsafe { let _ = RegCloseKey(hkey); };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    };
 }
 
 // ─── 再起動時削除スケジュール ────────────────────────────────────────────────
@@ -279,7 +328,8 @@ fn set_autostart_for_exe(exe: &Path, enable: bool) {
 /// バッチファイル方式より安全で、セキュリティソフトに誤検出されにくい。
 fn schedule_delete_on_reboot(path: &Path) {
     use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
-    let path_w: Vec<u16> = path.to_string_lossy()
+    let path_w: Vec<u16> = path
+        .to_string_lossy()
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -297,34 +347,48 @@ fn schedule_delete_on_reboot(path: &Path) {
 fn write_reg_sz(hkey: HKEY, name: PCWSTR, value: &str) {
     let utf16: Vec<u16> = value.encode_utf16().chain(std::iter::once(0u16)).collect();
     let bytes: Vec<u8> = utf16.iter().flat_map(|c| c.to_le_bytes()).collect();
-    unsafe { let _ = RegSetValueExW(hkey, name, None, REG_SZ, Some(&bytes)); };
+    unsafe {
+        let _ = RegSetValueExW(hkey, name, None, REG_SZ, Some(&bytes));
+    };
 }
 
 fn write_reg_dword(hkey: HKEY, name: PCWSTR, value: u32) {
     let bytes = value.to_le_bytes();
-    unsafe { let _ = RegSetValueExW(hkey, name, None, REG_DWORD, Some(&bytes)); };
+    unsafe {
+        let _ = RegSetValueExW(hkey, name, None, REG_DWORD, Some(&bytes));
+    };
 }
 
 fn read_reg_sz(hkey: HKEY, name: PCWSTR) -> Option<String> {
     let mut size = 0u32;
-    let err = unsafe {
-        RegQueryValueExW(hkey, name, None, None, None, Some(&mut size))
-    };
+    let err = unsafe { RegQueryValueExW(hkey, name, None, None, None, Some(&mut size)) };
     if err != ERROR_SUCCESS || size == 0 {
         return None;
     }
     let mut buf = vec![0u8; size as usize];
     let err = unsafe {
-        RegQueryValueExW(hkey, name, None, None, Some(buf.as_mut_ptr()), Some(&mut size))
+        RegQueryValueExW(
+            hkey,
+            name,
+            None,
+            None,
+            Some(buf.as_mut_ptr()),
+            Some(&mut size),
+        )
     };
     if err != ERROR_SUCCESS {
         return None;
     }
     // buf は UTF-16LE バイト列（NUL 終端含む）
-    let words: Vec<u16> = buf.chunks_exact(2)
+    let words: Vec<u16> = buf
+        .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    Some(String::from_utf16_lossy(&words).trim_end_matches('\0').to_string())
+    Some(
+        String::from_utf16_lossy(&words)
+            .trim_end_matches('\0')
+            .to_string(),
+    )
 }
 
 // ─── スタートメニューショートカット ──────────────────────────────────────────
@@ -342,7 +406,9 @@ fn shortcut_path() -> PathBuf {
 fn create_start_menu_shortcut(install_dir: &Path) {
     let com_init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     unsafe { try_create_shortcut(install_dir) };
-    if com_init.is_ok() { unsafe { CoUninitialize() }; }
+    if com_init.is_ok() {
+        unsafe { CoUninitialize() };
+    }
 }
 
 unsafe fn try_create_shortcut(install_dir: &Path) {
@@ -352,10 +418,18 @@ unsafe fn try_create_shortcut(install_dir: &Path) {
     };
 
     let target = install_dir.join("emakiwm.exe");
-    let target_w: Vec<u16> = target.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let target_w: Vec<u16> = target
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let _ = link.SetPath(PCWSTR(target_w.as_ptr()));
     let _ = link.SetDescription(w!("emakiwm - niri風スクロールタイリングWM"));
-    let workdir_w: Vec<u16> = install_dir.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let workdir_w: Vec<u16> = install_dir
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let _ = link.SetWorkingDirectory(PCWSTR(workdir_w.as_ptr()));
 
     let persist: IPersistFile = match windows_core::Interface::cast(&link) {
@@ -364,7 +438,11 @@ unsafe fn try_create_shortcut(install_dir: &Path) {
     };
 
     let lnk = shortcut_path();
-    let lnk_w: Vec<u16> = lnk.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let lnk_w: Vec<u16> = lnk
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let _ = persist.Save(PCWSTR(lnk_w.as_ptr()), true);
 }
 

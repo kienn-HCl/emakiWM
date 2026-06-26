@@ -39,7 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetForegroundWindow,
     GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindow,
     PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-    GWL_EXSTYLE, LWA_ALPHA, SW_SHOWDEFAULT, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WS_EX_LAYERED,
+    GWL_EXSTYLE, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, WM_CLOSE, WS_EX_LAYERED,
 };
 
 use crate::events::{self, WmEvent};
@@ -1339,6 +1339,9 @@ fn shell_spawn(cmd: &str) {
     if result.0 as isize > 32 {
         tracing::info!("spawn: {cmd}");
     } else {
-        tracing::warn!("spawn \"{cmd}\" failed (ShellExecuteW={})", result.0 as isize);
+        tracing::warn!(
+            "spawn \"{cmd}\" failed (ShellExecuteW={})",
+            result.0 as isize
+        );
     }
 }

@@ -9,13 +9,12 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Controls::{
-    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON,
+    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_CANCEL_BUTTON,
     TDF_ALLOW_DIALOG_CANCELLATION, TDF_USE_COMMAND_LINKS,
-    TDCBF_CANCEL_BUTTON,
 };
 use windows::Win32::UI::Shell::{
-    FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
+    FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM,
+    FOS_PICKFOLDERS,
 };
 
 use crate::install::{default_install_dir, read_install_dir, InstallOptions, UninstallOptions};
@@ -83,12 +82,10 @@ pub fn show_install_dialog() -> Option<InstallOptions> {
         let content = format!("インストール先:\n{dir_str}");
         let content_w: Vec<u16> = content.encode_utf16().chain(std::iter::once(0)).collect();
 
-        let buttons = [
-            TASKDIALOG_BUTTON {
-                nButtonID: BTN_CHANGE_DIR,
-                pszButtonText: w!("フォルダを変更..."),
-            },
-        ];
+        let buttons = [TASKDIALOG_BUTTON {
+            nButtonID: BTN_CHANGE_DIR,
+            pszButtonText: w!("フォルダを変更..."),
+        }];
 
         let mut result_btn = 0i32;
         let cfg = TASKDIALOGCONFIG {
@@ -99,8 +96,7 @@ pub fn show_install_dialog() -> Option<InstallOptions> {
             cButtons: buttons.len() as u32,
             pButtons: buttons.as_ptr(),
             nDefaultButton: 1, // IDOK
-            dwCommonButtons: windows::Win32::UI::Controls::TDCBF_OK_BUTTON
-                | TDCBF_CANCEL_BUTTON,
+            dwCommonButtons: windows::Win32::UI::Controls::TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON,
             dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
             ..Default::default()
         };
@@ -116,7 +112,9 @@ pub fn show_install_dialog() -> Option<InstallOptions> {
             }
             1 => break, // IDOK
             _ => {
-                if com_init.is_ok() { unsafe { CoUninitialize() }; }
+                if com_init.is_ok() {
+                    unsafe { CoUninitialize() };
+                }
                 return None;
             }
         }
@@ -159,7 +157,9 @@ pub fn show_install_dialog() -> Option<InstallOptions> {
     }
     .ok();
 
-    if com_init.is_ok() { unsafe { CoUninitialize() }; }
+    if com_init.is_ok() {
+        unsafe { CoUninitialize() };
+    }
 
     match result_btn {
         BTN_LAUNCH | BTN_NO_LAUNCH => Some(InstallOptions {
@@ -188,16 +188,12 @@ pub fn show_uninstall_dialog() -> Option<UninstallOptions> {
         pszContent: PCWSTR(content_w.as_ptr()),
         pszVerificationText: w!("設定ファイルも削除する（%USERPROFILE%\\.config\\emakiwm）"),
         nDefaultButton: 1, // IDOK
-        dwCommonButtons: windows::Win32::UI::Controls::TDCBF_OK_BUTTON
-            | TDCBF_CANCEL_BUTTON,
+        dwCommonButtons: windows::Win32::UI::Controls::TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON,
         dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
         ..Default::default()
     };
 
-    unsafe {
-        TaskDialogIndirect(&cfg, Some(&mut result_btn), None, Some(&mut del_config))
-    }
-    .ok();
+    unsafe { TaskDialogIndirect(&cfg, Some(&mut result_btn), None, Some(&mut del_config)) }.ok();
 
     if result_btn == 1 {
         // IDOK
@@ -227,9 +223,10 @@ fn pick_folder(default: &std::path::Path) -> Option<PathBuf> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        if let Ok(item) =
-            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(default_w.as_ptr()), None::<&IBindCtx>)
-        {
+        if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(
+            PCWSTR(default_w.as_ptr()),
+            None::<&IBindCtx>,
+        ) {
             let _ = dialog.SetFolder(&item);
         }
 
@@ -238,8 +235,9 @@ fn pick_folder(default: &std::path::Path) -> Option<PathBuf> {
         }
 
         let result: IShellItem = dialog.GetResult().ok()?;
-        let display =
-            result.GetDisplayName(windows::Win32::UI::Shell::SIGDN_FILESYSPATH).ok()?;
+        let display = result
+            .GetDisplayName(windows::Win32::UI::Shell::SIGDN_FILESYSPATH)
+            .ok()?;
         let path_str = display.to_string().ok()?;
         Some(PathBuf::from(path_str))
     }

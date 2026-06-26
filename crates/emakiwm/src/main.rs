@@ -8,8 +8,6 @@
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
-mod tray;
-#[cfg(windows)]
 mod border;
 #[cfg(windows)]
 mod com;
@@ -21,6 +19,8 @@ mod events;
 mod ipc;
 #[cfg(windows)]
 mod scan;
+#[cfg(windows)]
+mod tray;
 #[cfg(windows)]
 mod wm;
 #[cfg(windows)]
@@ -110,5 +110,7 @@ fn main() {
 fn attach_console() {
     use windows::Win32::System::Console::AttachConsole;
     // ATTACH_PARENT_PROCESS = 0xFFFFFFFF
-    unsafe { let _ = AttachConsole(u32::MAX); };
+    unsafe {
+        let _ = AttachConsole(u32::MAX);
+    };
 }

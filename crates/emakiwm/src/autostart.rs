@@ -8,8 +8,7 @@ use windows::Win32::System::Registry::{
     KEY_SET_VALUE, REG_SZ,
 };
 
-const RUN_SUBKEY: windows::core::PCWSTR =
-    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_SUBKEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const VALUE_NAME: windows::core::PCWSTR = w!("emakiwm");
 
 pub fn set_autostart(enable: bool) {
@@ -26,7 +25,15 @@ pub fn set_autostart(enable: bool) {
 /// インストーラから呼ぶ用: インストール先のパスを明示的に指定する。
 pub fn set_autostart_for_exe(exe: &std::path::Path, enable: bool) {
     let mut hkey = HKEY::default();
-    let err = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, RUN_SUBKEY, None, KEY_SET_VALUE, &mut hkey) };
+    let err = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            RUN_SUBKEY,
+            None,
+            KEY_SET_VALUE,
+            &mut hkey,
+        )
+    };
     if err != ERROR_SUCCESS {
         eprintln!("autostart: レジストリキーを開けませんでした (err={err:?})");
         return;
@@ -51,5 +58,7 @@ pub fn set_autostart_for_exe(exe: &std::path::Path, enable: bool) {
         }
     }
 
-    unsafe { let _ = RegCloseKey(hkey); };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    };
 }

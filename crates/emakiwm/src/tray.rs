@@ -4,18 +4,18 @@
 //! - remove():    restore_all() など終了経路から呼ぶ。NIM_DELETE でゴーストを防ぐ
 //! - handle_message(): settings_wnd_proc から WM_TRAY / TaskbarCreated を転送する
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::OnceLock;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION, LoadIconW,
-    MF_SEPARATOR, MF_STRING, PostMessageW, RegisterWindowMessageW, SetForegroundWindow,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL, WM_RBUTTONUP,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, PostMessageW,
+    RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, IDI_APPLICATION, MF_SEPARATOR,
+    MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL, WM_RBUTTONUP,
 };
 
 use crate::events::WmEvent;
@@ -48,12 +48,18 @@ pub fn remove() {
         return;
     }
     let data = base_nid(HWND(h as _));
-    unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &data); };
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+    };
 }
 
 /// settings_wnd_proc からトレイ関連メッセージを受け取るか判定する。
 pub fn is_tray_message(msg: u32) -> bool {
-    msg == WM_TRAY || TASKBAR_CREATED_MSG.get().copied().is_some_and(|id| id == msg)
+    msg == WM_TRAY
+        || TASKBAR_CREATED_MSG
+            .get()
+            .copied()
+            .is_some_and(|id| id == msg)
 }
 
 /// settings_wnd_proc からトレイ関連メッセージを処理する。
@@ -76,11 +82,16 @@ fn register_icon(hwnd: HWND) {
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = WM_TRAY;
     data.hIcon = hicon;
-    let tip: Vec<u16> = "emakiwm".encode_utf16().chain(std::iter::once(0u16)).collect();
+    let tip: Vec<u16> = "emakiwm"
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
     for (i, &c) in tip.iter().enumerate().take(128) {
         data.szTip[i] = c;
     }
-    unsafe { let _ = Shell_NotifyIconW(NIM_ADD, &data); };
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_ADD, &data);
+    };
 }
 
 unsafe fn show_menu(hwnd: HWND) {
