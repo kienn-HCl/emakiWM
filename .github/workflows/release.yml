@@ -14,17 +14,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --workspace
-      - name: パッケージを zip にまとめる
+      - name: パッケージを作成する
         run: |
           $ver = "${{ github.ref_name }}"
           $zip = "emakiwm-${ver}-windows.zip"
+          # メインパッケージ: emakiwm 本体 + セットアップ
           Compress-Archive -Path `
             target/release/emakiwm.exe, `
-            target/release/emakiwmc.exe, `
             target/release/emakiwm-setup.exe `
             -DestinationPath $zip
           echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
         shell: pwsh
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ZIP_NAME }}
+          files: |
+            ${{ env.ZIP_NAME }}
+            target/release/emakiwmc.exe

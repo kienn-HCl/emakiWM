@@ -23,8 +23,11 @@ const UNINSTALL_SUBKEY: PCWSTR =
 const ENV_SUBKEY: PCWSTR = w!("Environment");
 const PATH_VALUE: PCWSTR = w!("Path");
 
-/// インストール対象のバイナリ名。
-const BINARIES: &[&str] = &["emakiwm.exe", "emakiwmc.exe", "emakiwm-setup.exe"];
+/// 必須バイナリ（存在しない場合はインストールエラー）。
+const REQUIRED: &[&str] = &["emakiwm.exe", "emakiwm-setup.exe"];
+/// オプショナルバイナリ（存在する場合のみコピー）。
+/// emakiwmc は CLI IPC ツールで上級者向けのため別途ダウンロード形式。
+const OPTIONAL: &[&str] = &["emakiwmc.exe"];
 
 pub struct InstallOptions {
     pub install_dir: PathBuf,
@@ -44,8 +47,8 @@ pub fn install(opts: &InstallOptions) -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("実行ファイルの親ディレクトリが取得できません"))?
         .to_path_buf();
 
-    // ソースバイナリの存在確認
-    for name in BINARIES {
+    // 必須バイナリの存在確認
+    for name in REQUIRED {
         let src = src_dir.join(name);
         if !src.exists() {
             return Err(std::io::Error::other(format!(
@@ -58,9 +61,16 @@ pub fn install(opts: &InstallOptions) -> std::io::Result<()> {
     // インストール先を作成
     std::fs::create_dir_all(dir)?;
 
-    // バイナリをコピー
-    for name in BINARIES {
+    // 必須バイナリをコピー
+    for name in REQUIRED {
         std::fs::copy(src_dir.join(name), dir.join(name))?;
+    }
+    // オプショナルバイナリは存在する場合のみコピー
+    for name in OPTIONAL {
+        let src = src_dir.join(name);
+        if src.exists() {
+            let _ = std::fs::copy(src, dir.join(name));
+        }
     }
 
     // PATH に追加
@@ -109,7 +119,7 @@ pub fn uninstall(opts: &UninstallOptions) -> std::io::Result<()> {
     }
 
     // バイナリ削除（setup.exe 自身以外）
-    for name in BINARIES {
+    for name in REQUIRED.iter().chain(OPTIONAL.iter()) {
         if *name == "emakiwm-setup.exe" {
             continue; // 実行中の自分は削除できないのでスキップ
         }
@@ -224,7 +234,7 @@ fn register_uninstall(install_dir: &Path) {
     write_reg_dword(hkey, w!("NoRepair"), 1);
 
     // インストールサイズ (KB)
-    let size_kb: u32 = BINARIES.iter().map(|name| {
+    let size_kb: u32 = REQUIRED.iter().chain(OPTIONAL.iter()).map(|name| {
         std::fs::metadata(install_dir.join(name))
             .map(|m| (m.len() / 1024) as u32)
             .unwrap_or(0)
