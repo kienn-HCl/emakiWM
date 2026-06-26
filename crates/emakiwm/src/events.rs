@@ -346,11 +346,12 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
 /// WH_MOUSE_LL: タイムスタンプ比較で Alt 押下を判定しフォーカス移動へ変換する。
 ///
 /// 判定ロジック:
-///   - last_down > last_up (循環比較) かつ スクロール時刻 - last_down < 1500ms
+/// - last_down > last_up (循環比較) かつ スクロール時刻 - last_down < 1500ms
+///
 /// これにより:
-///   - GetAsyncKeyState に依存しない → タッチパッドドライバの干渉を受けない
-///   - keyup をドライバに消費された場合でも 1.5s 後に自動解消 (刺さり防止)
-///   - キーリピートで last_down が更新されるため長押し中は制限なく動作する
+/// - GetAsyncKeyState に依存しない → タッチパッドドライバの干渉を受けない
+/// - keyup をドライバに消費された場合でも 1.5s 後に自動解消 (刺さり防止)
+/// - キーリピートで last_down が更新されるため長押し中は制限なく動作する
 unsafe extern "system" fn mouse_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 && wp.0 as u32 == WM_MOUSEWHEEL && MOUSE_SCROLL_FOCUS.load(Ordering::Relaxed) {
         let ms = &*(lp.0 as *const MSLLHOOKSTRUCT);

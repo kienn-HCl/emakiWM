@@ -47,13 +47,13 @@ pub fn remove() {
     if h == 0 {
         return;
     }
-    let mut data = base_nid(HWND(h as _));
-    unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &mut data); };
+    let data = base_nid(HWND(h as _));
+    unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &data); };
 }
 
 /// settings_wnd_proc からトレイ関連メッセージを受け取るか判定する。
 pub fn is_tray_message(msg: u32) -> bool {
-    msg == WM_TRAY || TASKBAR_CREATED_MSG.get().copied().map_or(false, |id| id == msg)
+    msg == WM_TRAY || TASKBAR_CREATED_MSG.get().copied().is_some_and(|id| id == msg)
 }
 
 /// settings_wnd_proc からトレイ関連メッセージを処理する。
@@ -80,7 +80,7 @@ fn register_icon(hwnd: HWND) {
     for (i, &c) in tip.iter().enumerate().take(128) {
         data.szTip[i] = c;
     }
-    unsafe { let _ = Shell_NotifyIconW(NIM_ADD, &mut data); };
+    unsafe { let _ = Shell_NotifyIconW(NIM_ADD, &data); };
 }
 
 unsafe fn show_menu(hwnd: HWND) {
@@ -126,9 +126,10 @@ unsafe fn show_menu(hwnd: HWND) {
 }
 
 fn base_nid(hwnd: HWND) -> NOTIFYICONDATAW {
-    let mut data = NOTIFYICONDATAW::default();
-    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    data.hWnd = hwnd;
-    data.uID = ICON_ID;
-    data
+    NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: ICON_ID,
+        ..Default::default()
+    }
 }
