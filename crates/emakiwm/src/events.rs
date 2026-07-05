@@ -65,6 +65,10 @@ pub enum WmEvent {
     /// フォーカスウィンドウの opacity ピンのトグル (FR-3.8)。
     /// ピン中は非フォーカスでも pinned_opacity を維持する
     ToggleOpacity,
+    /// 隣のモニタへフォーカスを移動する。true = 右/次
+    FocusMonitor(bool),
+    /// フォーカスウィンドウを隣のモニタへ移動する。true = 右/次
+    MoveToMonitor(bool),
     /// 設定ファイルの再読込 (FR-7.2)
     Reload,
     /// 解像度・タスクバー等の変更 (WM_DISPLAYCHANGE / WM_SETTINGCHANGE)。
@@ -120,6 +124,10 @@ pub fn parse_command(s: &str) -> Option<WmEvent> {
         ("fullscreen", "") => WmEvent::Fullscreen,
         ("close", "") => WmEvent::CloseFocused,
         ("toggle-opacity", "") => WmEvent::ToggleOpacity,
+        ("focus-monitor", "right") => WmEvent::FocusMonitor(true),
+        ("focus-monitor", "left") => WmEvent::FocusMonitor(false),
+        ("move-to-monitor", "right") => WmEvent::MoveToMonitor(true),
+        ("move-to-monitor", "left") => WmEvent::MoveToMonitor(false),
         ("reload", "") => WmEvent::Reload,
         ("quit", "") => WmEvent::Shutdown,
         _ => return None,

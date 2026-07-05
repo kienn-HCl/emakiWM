@@ -27,7 +27,13 @@ anim_ms = 180
 
 # Viewport 外 (スクロールで画面外に出た列・非アクティブワークスペース) の隠し方:
 #   "offscreen" (デフォルト): モニタ外座標へ退避。Alt+Tab・タスクバーには残る
-#   "cloak":                  完全に隠す。Alt+Tab・タスクバーからも消える
+#   "cloak":                  描画を止めて隠す。アクティブワークスペースの
+#                             viewport 外の列は Alt+Tab・タスクバーに残り、
+#                             選ぶとその列までスクロールして戻る。
+#                             非アクティブワークスペースは Alt+Tab からも消える
+# 複数モニターでは "cloak" 推奨: 退避経路が隣のモニターに重なる移動
+# (上下配置のワークスペース切替など) も縁でクリップして滑らかにアニメできる。
+# "offscreen" ではその移動のみアニメせず即時反映になる
 hide = "offscreen"
 
 # 新しく開いた Column の幅 (Viewport に対する比率)。0.1〜1.0。デフォルト 0.5
@@ -130,6 +136,8 @@ default_width_ratio = 0.5
 #   close                       フォーカスウィンドウを閉じる
 #   toggle-opacity              フォーカスウィンドウの opacity ピンをトグル
 #                               (ピン中は非フォーカスでも pinned_opacity を維持)
+#   focus-monitor left|right    フォーカスを左/右の物理モニタへ移動 (ループ)
+#   move-to-monitor left|right  フォーカスウィンドウを左/右の物理モニタへ移動 (ループ)
 #   spawn <コマンドライン>       アプリ起動 (例: spawn notepad / spawn wt -p NixOS)。
 #                               空白区切りで分割される (引用符は未対応)
 #   reload                      設定ファイル再読込
@@ -164,6 +172,12 @@ default_width_ratio = 0.5
 # 例: アプリ起動 (Alt+Enter でターミナル、Alt+B でブラウザ)
 #"alt+enter" = "spawn wt"
 #"alt+b" = "spawn firefox"
+
+# 例: 複数モニター操作 (キーは好みに合わせて変更)
+#"ctrl+alt+l" = "focus-monitor right"    # 右のモニタへフォーカス
+#"ctrl+alt+h" = "focus-monitor left"     # 左のモニタへフォーカス
+#"ctrl+alt+shift+l" = "move-to-monitor right"  # 右のモニタへウィンドウを移動
+#"ctrl+alt+shift+h" = "move-to-monitor left"   # 左のモニタへウィンドウを移動
 
 # ─────────────────────────────────────────────
 # 既知の制約 (FR-6.4)
