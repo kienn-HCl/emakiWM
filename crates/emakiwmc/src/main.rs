@@ -3,6 +3,7 @@
 
 const USAGE: &str = "\
 usage: emakiwmc <command>
+       emakiwmc --version          この CLI のバージョンを表示 (WM のバージョンは state の \"version\")
 
 commands:
   state                       状態を JSON で取得
@@ -28,6 +29,10 @@ fn main() {
     use std::io::{Read, Write};
 
     let cmd = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    if cmd == "--version" || cmd == "-V" {
+        println!("emakiwmc {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if cmd.is_empty() || cmd == "--help" || cmd == "-h" {
         eprintln!("{USAGE}");
         std::process::exit(2);

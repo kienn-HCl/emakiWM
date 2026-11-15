@@ -1524,6 +1524,8 @@ fn state_json(state: &State, overview: bool) -> String {
         "focused": state.focused.map(|f| f.0),
         "fullscreen": state.fullscreen.map(|f| f.0),
         "overview": overview,
+        // 動作中の WM のバージョン (exe を入れ替えたのに古いプロセスが残っていないかの確認用)
+        "version": env!("CARGO_PKG_VERSION"),
         "floating": state.floating.iter().map(|f| f.0).collect::<Vec<_>>(),
         "passive_floats": state.passive_floats.iter().map(|f| f.0).collect::<Vec<_>>(),
         "workspaces": active_workspaces,

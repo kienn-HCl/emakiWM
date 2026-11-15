@@ -32,6 +32,13 @@ mod ws;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // --version: 他のフラグより先に判定する (WM を起動しない)
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        #[cfg(windows)]
+        attach_console();
+        println!("emakiwm {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let verbose = args.iter().any(|a| a == "--verbose");
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let restore = args.iter().any(|a| a == "--restore");

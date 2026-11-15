@@ -132,6 +132,7 @@ emakiwmc state      # 状態を JSON で取得
 emakiwmc reload     # 設定を再読み込み
 emakiwmc quit       # WM 終了
 emakiwmc spawn wt   # アプリを起動
+emakiwmc --version  # CLI のバージョンを表示 (動作中の WM のバージョンは state の "version")
 ```
 
 ## 既知の制約
@@ -177,4 +178,5 @@ emakiwm --autostart off  # 解除
 emakiwm --restore       # state.json の位置へウィンドウを戻す
 emakiwm --uncloak-all   # cloak が残ったウィンドウを一括解除
 emakiwm --dry-run       # 管理対象の判定を確認 (デバッグ用)
+emakiwm --version       # バージョンを表示
 ```
