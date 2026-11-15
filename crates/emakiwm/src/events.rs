@@ -17,13 +17,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, HOT_KEY_MODIFIERS, VK_LMENU, VK_MENU, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-    SetWindowsHookExW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_HOTKEY,
-    WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageTime, GetMessageW,
+    RegisterClassW, SetWindowsHookExW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY,
+    EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+    OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE,
+    WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
 };
+
+use crate::touchpad::GestureBinds;
 
 /// Core スレッドへ送るイベント。hwnd は isize (HWND は Send でないため)。
 #[derive(Debug, Clone)]
@@ -178,7 +181,13 @@ static ALT_UP_TICK: AtomicU32 = AtomicU32::new(1);
 /// キーバインドの変更はプロセス再起動が必要 (フックスレッドで登録するため)。
 /// mouse_scroll_focus が false のときは WH_KEYBOARD_LL / WH_MOUSE_LL を登録しない
 /// (不要なグローバルフックはセキュリティソフトの誤検出を招くため)。
-pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>, mouse_scroll_focus: bool) {
+/// gestures も同様に、割当が 1 つもなければ Raw Input を登録しない。
+pub fn spawn_hook_thread(
+    tx: Sender<WmEvent>,
+    hotkeys: Vec<Hotkey>,
+    mouse_scroll_focus: bool,
+    gestures: GestureBinds,
+) {
     SENDER.set(tx).expect("hook thread spawned twice");
 
     std::thread::spawn(move || unsafe {
@@ -225,6 +234,11 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, hotkeys: Vec<Hotkey>, mouse_scroll
                 None,
             ) {
                 crate::tray::setup(hwnd);
+                // 3 本指スワイプ (FR-6.5): タッチパッドの Raw Input をこの
+                // ウィンドウ宛に登録する。割当がなければ購読自体しない
+                if !gestures.is_empty() {
+                    crate::touchpad::register(hwnd, gestures);
+                }
             }
         }
 
@@ -296,6 +310,12 @@ unsafe extern "system" fn settings_wnd_proc(
                 let _ = tx.send(WmEvent::WorkAreaChanged);
             }
             LRESULT(0)
+        }
+        // タッチパッド HID レポート (FR-6.5)。処理後もシステム側の後始末が
+        // 必要なため DefWindowProc へ流す
+        WM_INPUT => {
+            crate::touchpad::handle_input(lp, unsafe { GetMessageTime() } as u32);
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         _ if crate::tray::is_tray_message(msg) => {
             crate::tray::handle_message(hwnd, msg, lp);

@@ -6,4 +6,5 @@
 
 pub mod anim;
 pub mod filter;
+pub mod gesture;
 pub mod layout;

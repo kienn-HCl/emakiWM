@@ -20,6 +20,8 @@ mod ipc;
 #[cfg(windows)]
 mod scan;
 #[cfg(windows)]
+mod touchpad;
+#[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod wm;

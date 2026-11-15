@@ -13,6 +13,7 @@ use emakiwm_core::filter::{Rule, RuleAction};
 use serde::Deserialize;
 
 use crate::events::{parse_command, Hotkey};
+use crate::touchpad::GestureBinds;
 
 // RegisterHotKey の modifier 値 (winuser.h)
 const MOD_ALT: u32 = 0x1;
@@ -73,6 +74,9 @@ struct ConfigFile {
     mouse_scroll_focus: Option<bool>,
     rules: Vec<RuleEntry>,
     keybinds: BTreeMap<String, String>,
+    /// 3 本指スワイプの割当 (FR-6.5): "swipe3-up" 等 → コマンド構文。
+    /// 空なら Raw Input を購読しない。反映には再起動が必要
+    gestures: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +115,8 @@ pub struct Config {
     pub mouse_scroll_focus: bool,
     pub rules: Vec<Rule>,
     pub hotkeys: Vec<Hotkey>,
+    /// 3 本指スワイプの割当 (FR-6.5)。全方向 None なら機能無効
+    pub gestures: GestureBinds,
 }
 
 pub fn path() -> PathBuf {
@@ -187,6 +193,24 @@ pub fn load() -> Config {
         })
         .collect();
 
+    let mut gestures = GestureBinds::default();
+    for (k, v) in &file.gestures {
+        if v.is_empty() || v == "none" {
+            continue;
+        }
+        let Some(event) = parse_command(v) else {
+            tracing::warn!("コマンド \"{v}\" を解釈できません (ジェスチャ {k})");
+            continue;
+        };
+        match k.as_str() {
+            "swipe3-up" => gestures.up = Some(event),
+            "swipe3-down" => gestures.down = Some(event),
+            "swipe3-left" => gestures.left = Some(event),
+            "swipe3-right" => gestures.right = Some(event),
+            other => tracing::warn!("不明なジェスチャ \"{other}\" (swipe3-up/down/left/right)"),
+        }
+    }
+
     let cloak = match file.hide.as_deref() {
         None | Some("offscreen") => false,
         Some("cloak") => true,
@@ -217,6 +241,7 @@ pub fn load() -> Config {
         mouse_scroll_focus: file.mouse_scroll_focus.unwrap_or(false),
         rules,
         hotkeys,
+        gestures,
     }
 }
 

@@ -108,6 +108,10 @@ komorebi / GlazeWM と同様に **外部プロセスから既存ウィンドウ�
 - FR-6.4 既知の制約 (ドキュメントに明記する):
   - 非昇格プロセスの `RegisterHotKey` は、管理者権限ウィンドウがフォアグラウンドの間は発火しない (UIPI)
   - Alt+Shift 系バインドは Windows のキーボードレイアウト切替 (Alt+Shift) と衝突し得る。切替ホットキーの無効化手順を README で案内する
+- FR-6.5 タッチパッドの 3 本指スワイプ (Precision Touchpad) に任意コマンドを割当可能
+  - Raw Input (HID Usage 0x0D:0x05) を直接解析し、OS のジェスチャ設定に依存しない
+  - 設定 `[gestures]` の `swipe3-up/down/left/right` (値はキーバインドと同じコマンド構文)。未設定なら Raw Input を購読しない
+  - 制約: OS 側の 3 本指ジェスチャ設定と併用すると二重反応するため、OS 側を「なし」にする手順を README で案内する。反映には再起動が必要
 
 ### FR-7 設定・IPC
 - FR-7.1 設定ファイル: TOML。場所は `%USERPROFILE%\.config\emakiwm\config.toml`

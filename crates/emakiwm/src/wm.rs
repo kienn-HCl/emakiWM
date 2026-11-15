@@ -122,7 +122,12 @@ pub fn run() {
     events::set_mouse_scroll_focus(cfg.mouse_scroll_focus);
 
     let (tx, rx) = mpsc::channel::<WmEvent>();
-    events::spawn_hook_thread(tx.clone(), cfg.hotkeys.clone(), cfg.mouse_scroll_focus);
+    events::spawn_hook_thread(
+        tx.clone(),
+        cfg.hotkeys.clone(),
+        cfg.mouse_scroll_focus,
+        cfg.gestures.clone(),
+    );
     if let Some(port) = cfg.ws_port {
         ws::spawn_ws_thread(port, tx.clone());
     }
@@ -678,7 +683,7 @@ pub fn run() {
                     }
                     bordered = None;
                     tracing::info!(
-                        "config reloaded: gap={} anim={:?} rules={} cloak={} (キーバインド変更は再起動が必要)",
+                        "config reloaded: gap={} anim={:?} rules={} cloak={} (キーバインド・ジェスチャ変更は再起動が必要)",
                         cfg.gap,
                         cfg.anim,
                         cfg.rules.len(),
