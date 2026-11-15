@@ -329,3 +329,23 @@ J/K はワークスペース切替にフォールバックする。
   `GetWindowRect` 等の座標が DPI 仮想化で狂う。Phase 0 で先行対応済み
 - **cargo test の分離**: `emakiwm-core` は Win32 非依存のため、
   Linux ネイティブの `cargo test` でレイアウトロジックの単体テストを実行できる
+
+---
+
+## 6. アプリアイコン
+
+- **置き場所**: `assets/icon/emakiwm.ico` (16/20/24/32/40/48/64/256 のマルチサイズ)。
+  元データは `assets/icon/emakiwm.svg` (後で追加予定) から ImageMagick 等で生成する。
+  差し替えは .ico を置き換えるだけでよく、コード変更は不要。
+- **埋め込み**: `emakiwm` / `emakiwm-setup` / `emakiwmc` の `build.rs` が `embed-resource` で
+  `1 ICON "<.ico の絶対パス>"` だけの .rc (OUT_DIR に生成) をコンパイルする。
+  マニフェストは従来どおり `embed-manifest` が埋め込むので、exe には RT_MANIFEST (id 1) が 1 つ、
+  アイコングループ (id 1) が入る (GNU: windres / MSVC: rc.exe)。`emakiwmc` はマニフェストなし。
+  .rc は相対パス解決に依存しないよう絶対パス (`/` 区切り) で参照する。
+- **トレイ**: `tray.rs` の `app_icon()` が `LoadImageW(GetModuleHandleW, リソース ID 1, IMAGE_ICON,
+  SM_CXSMICON x SM_CYSMICON)` で読み込む。TaskbarCreated での再登録時にリークしないよう
+  一度だけ読み込んで保持する。失敗時は `IDI_APPLICATION` にフォールバック。
+- **インストーラ**: アンインストールレジストリの `DisplayIcon` に `"<dir>\emakiwm.exe",0` を書く。
+  スタートメニューのショートカットは emakiwm.exe を指すので exe のアイコンを継承する。
+- **Nix**: flake は git 管理下のファイルだけを見るため、新規ファイル (.ico, build.rs) は
+  `git add` (または `-N`) してから `nix build` すること。

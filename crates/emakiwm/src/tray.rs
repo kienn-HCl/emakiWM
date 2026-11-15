@@ -9,13 +9,15 @@ use std::sync::OnceLock;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, PostMessageW,
-    RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, IDI_APPLICATION, MF_SEPARATOR,
-    MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL, WM_RBUTTONUP,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, LoadIconW,
+    LoadImageW, PostMessageW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, HICON,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, SM_CXSMICON,
+    SM_CYSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL, WM_RBUTTONUP,
 };
 
 use crate::events::WmEvent;
@@ -28,6 +30,12 @@ static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 
 const ICON_ID: u32 = 1;
+
+/// build.rs が埋め込むアイコン (RT_GROUP_ICON) のリソース ID。
+const APP_ICON_RESOURCE_ID: usize = 1;
+
+/// 読み込み済みアイコン。TaskbarCreated での再登録時に使い回し、ハンドルをリークさせない。
+static APP_ICON: AtomicIsize = AtomicIsize::new(0);
 const MENU_RELOAD: usize = 1;
 const MENU_QUIT: usize = 2;
 
@@ -77,7 +85,7 @@ pub fn handle_message(hwnd: HWND, msg: u32, lp: LPARAM) {
 }
 
 fn register_icon(hwnd: HWND) {
-    let hicon = unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() };
+    let hicon = app_icon();
     let mut data = base_nid(hwnd);
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = WM_TRAY;
@@ -92,6 +100,32 @@ fn register_icon(hwnd: HWND) {
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &data);
     };
+}
+
+/// 通知領域用 (小アイコンサイズ) のアイコンを返す。初回のみ読み込む。
+/// 埋め込みリソースの読み込みに失敗したら標準アイコンへフォールバックする。
+fn app_icon() -> HICON {
+    let cached = APP_ICON.load(Ordering::Relaxed);
+    if cached != 0 {
+        return HICON(cached as _);
+    }
+    let hicon = unsafe {
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        // MAKEINTRESOURCE 相当: ID を PCWSTR にそのまま詰める
+        LoadImageW(
+            Some(hinst.into()),
+            PCWSTR(APP_ICON_RESOURCE_ID as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+        .unwrap_or_default()
+    };
+    APP_ICON.store(hicon.0 as isize, Ordering::Relaxed);
+    hicon
 }
 
 unsafe fn show_menu(hwnd: HWND) {

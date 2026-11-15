@@ -1,0 +1,15 @@
+<!-- emakiWM アイコン (絵巻: 左右の軸と、紙に並ぶタイル)。emakiwm.ico はこの SVG から生成する:
+     for s in 16 20 24 32 40 48 64 256; do rsvg-convert -w $s -h $s emakiwm.svg -o $s.png; done
+     magick 16.png 20.png 24.png 32.png 40.png 48.png 64.png 256.png emakiwm.ico -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs><clipPath id="p"><rect x="36" y="56" width="184" height="144"/></clipPath></defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#94b089"/>
+  <rect x="36" y="56" width="184" height="144" fill="#fbf5e6"/>
+  <g clip-path="url(#p)">
+    <rect x="-4" y="70" width="80" height="116" rx="9" fill="#cfdec5"/>
+    <rect x="82" y="70" width="92" height="116" rx="9" fill="#6f9e69"/>
+    <rect x="180" y="70" width="80" height="116" rx="9" fill="#cfdec5"/>
+  </g>
+  <rect x="18" y="44" width="24" height="168" rx="12" fill="#a57c4a"/>
+  <rect x="214" y="44" width="24" height="168" rx="12" fill="#a57c4a"/>
+</svg>

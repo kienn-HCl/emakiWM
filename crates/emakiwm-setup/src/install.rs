@@ -253,11 +253,14 @@ fn register_uninstall(install_dir: &Path) {
     let quiet_str = format!("\"{}\" --uninstall --quiet", setup_exe.display());
     let version = env!("CARGO_PKG_VERSION");
     let install_dir_str = install_dir.to_string_lossy().to_string();
+    // 「アプリと機能」に表示するアイコン (emakiwm.exe 内の最初のアイコン)
+    let icon_str = format!("\"{}\",0", install_dir.join("emakiwm.exe").display());
 
     write_reg_sz(hkey, w!("DisplayName"), "emakiwm");
     write_reg_sz(hkey, w!("DisplayVersion"), version);
     write_reg_sz(hkey, w!("Publisher"), "frort");
     write_reg_sz(hkey, w!("InstallLocation"), &install_dir_str);
+    write_reg_sz(hkey, w!("DisplayIcon"), &icon_str);
     write_reg_sz(hkey, w!("UninstallString"), &uninstall_str);
     write_reg_sz(hkey, w!("QuietUninstallString"), &quiet_str);
     write_reg_sz(hkey, w!("URLInfoAbout"), "https://github.com/frort/emakiwm");
