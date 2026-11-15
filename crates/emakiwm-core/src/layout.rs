@@ -220,6 +220,26 @@ impl Strip {
         }
     }
 
+    /// Viewport 幅の変化 (解像度・gap・margin の変更) に合わせて全 Column の幅を
+    /// 比率を保って引き直す。maximize 中の Column は新しい全幅に追従する。
+    /// x は振り直さないので、呼び出し後に [`Strip::relayout`] すること。
+    pub fn rescale(&mut self, old_viewport_w: i32, new_viewport_w: i32) {
+        if old_viewport_w <= 0 || old_viewport_w == new_viewport_w {
+            return;
+        }
+        let scale = |w: i32| scale_width(w, old_viewport_w, new_viewport_w);
+        for c in &mut self.columns {
+            match c.saved_width {
+                Some(saved) => {
+                    c.saved_width = Some(scale(saved));
+                    c.width = new_viewport_w;
+                }
+                None => c.width = scale(c.width),
+            }
+        }
+        self.offset_x = scale(self.offset_x);
+    }
+
     /// フォーカス Column を左右の隣と入れ替える (FR-4.4)。端では no-op。
     pub fn move_column(&mut self, id: WindowId, dir: FocusDir, gap: i32) -> bool {
         let Some(i) = self.column_index_of(id) else {
@@ -462,9 +482,31 @@ impl Strip {
     }
 }
 
+/// 幅 `w` を viewport 幅の比 (`from` → `to`) で引き直す (四捨五入)。
+pub fn scale_width(w: i32, from: i32, to: i32) -> i32 {
+    if from <= 0 {
+        return w;
+    }
+    ((w as i64 * to as i64 + from as i64 / 2) / from as i64) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescale_keeps_width_ratio_and_follows_maximize() {
+        let mut s = Strip::default();
+        s.insert_column_after(None, WindowId(1), 600, 8);
+        s.insert_column_after(Some(WindowId(1)), WindowId(2), 900, 8);
+        s.toggle_maximize(WindowId(2), 1800, 8);
+        s.rescale(1800, 1200);
+        s.relayout(8);
+        assert_eq!(s.columns[0].width, 400); // 1/3 のまま
+        assert_eq!(s.columns[1].width, 1200); // maximize は新しい全幅
+        assert_eq!(s.columns[1].saved_width, Some(600));
+        assert_eq!(s.columns[1].x, 408);
+    }
 
     const GAP: i32 = 8;
     const WORK: Rect = Rect {

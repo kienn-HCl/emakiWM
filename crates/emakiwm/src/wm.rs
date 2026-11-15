@@ -8,7 +8,11 @@
 //! - 復元 Rect は state.json へも永続化し、kill 後は `--restore` で戻せる (FR-1.6)
 //! - 各物理モニターが独立した Stack (ワークスペース列) を持つ
 //!
-//! 状態の持ち方: `strip` は常に最終ターゲット (論理状態) を保持し、
+//! 役割分担: 論理状態とイベントに対する状態遷移は `emakiwm_core::state::State`
+//! (純粋ロジック) が持つ。このモジュールは Win32 への問い合わせと副作用
+//! (配置・前面化・cloak・枠・永続化) だけを担う。
+//!
+//! 状態の持ち方: `State` は常に最終ターゲット (論理状態) を保持し、
 //! 画面上の現在位置は `visual` マップが持つ。アニメーションは visual → 論理状態の
 //! 射影 (targets) への補間。イベントで論理状態が変われば、進行中のアニメは
 //! 現在の visual から新ターゲットへ向け直される (§8-8)。
@@ -22,26 +26,30 @@ use std::time::{Duration, Instant};
 
 use emakiwm_core::anim::{ease_out_cubic, lerp_rect};
 use emakiwm_core::filter::Decision;
-use emakiwm_core::layout::{FocusDir, Placement, Rect, Stack, WindowId};
+use emakiwm_core::layout::{Rect, WindowId};
+use emakiwm_core::state::{Monitor, MonitorGeom, State};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{
-    COLORREF, HWND, LPARAM, POINT, RECT, TYPE_E_ELEMENTNOTFOUND, WPARAM,
+    GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, POINT, RECT,
+    TYPE_E_ELEMENTNOTFOUND, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurrentThreadId};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetForegroundWindow,
     GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-    GWL_EXSTYLE, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, WM_CLOSE, WS_EX_LAYERED,
+    IsZoomed, PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    SetWindowPos, GWL_EXSTYLE, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, WM_CLOSE,
+    WS_EX_LAYERED,
 };
 
 use crate::events::{self, WmEvent};
@@ -49,6 +57,15 @@ use crate::{border, com, config, ipc, scan, tray, ws};
 
 /// アニメーション中のフレーム間隔。
 const FRAME: Duration = Duration::from_millis(8);
+
+/// 実フレーム幅と要求幅の差がこれ以下なら同じとみなす (px)。丸め誤差の吸収用。
+const SIZE_TOLERANCE: i32 = 2;
+
+/// 1 回のレイアウト変化につき実サイズを読み戻す回数の上限と、再確認の間隔 (FR-3.6)。
+/// 配置完了後に実サイズを読み戻すタイミング (FR-3.6)。完了直後に 1 回確認し、
+/// その後は前回からこの間隔 (ms) で再確認する。要求サイズを一旦受け入れてから
+/// 遅れて広がり直すアプリ (Firefox 等) を拾うため。
+const SIZE_RECHECK_MS: [u64; 4] = [40, 80, 180, 400];
 
 /// 終了時復元用の元 Rect (FR-1.5)。
 /// panic フックと Ctrl+C ハンドラから参照するためグローバルに持つ。
@@ -99,23 +116,17 @@ struct AnimEntry {
 /// (left, top, right, bottom)。論理 Rect (見た目のフレーム) ⇔ ウィンドウ Rect の変換に使う。
 type Border = (i32, i32, i32, i32);
 
-/// 1 物理モニターぶんの状態。
-struct MonitorState {
-    /// HMONITOR 値 (モニター識別用)
-    hmonitor: isize,
-    /// 実効作業領域 (gap・margin 適用後)
-    work: Rect,
-    /// モニター全面 (fullscreen 用)
-    monitor: Rect,
-    /// work.w - 2 * gap
-    viewport_w: i32,
-    /// 新規 Column のデフォルト幅
-    default_width: i32,
-    /// このモニターのワークスペース列
-    stack: Stack,
-}
-
 pub fn run() {
+    // 多重起動の防止: 2 つの WM が同じウィンドウを取り合うと配置が壊れる。
+    // ハンドルは閉じず、プロセス終了時に OS が解放する
+    unsafe {
+        let mutex = CreateMutexW(None, false, windows::core::w!("Local\\emakiwm-instance"));
+        if mutex.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
+            tracing::error!("emakiwm は既に起動しています");
+            return;
+        }
+    }
+
     install_restore_hooks();
 
     let mut cfg = config::load();
@@ -133,43 +144,47 @@ pub fn run() {
     }
     ipc::spawn_ipc_thread(tx);
 
-    let mut monitors = enumerate_monitors(&cfg);
-    let mut active_monitor = 0usize;
+    let mut geoms = monitor_geoms(&cfg);
+    if geoms.is_empty() {
+        // 列挙失敗時のフォールバック: プライマリモニターのみ
+        let (work, monitor) = primary_monitor_fallback();
+        geoms.push(MonitorGeom {
+            hmonitor: 0,
+            work,
+            monitor,
+        });
+    }
+    let mut state = State::new(&geoms, cfg.gap, cfg.default_ratio);
     tracing::info!(
         "monitors: {}",
-        monitors
+        state
+            .monitors
             .iter()
             .enumerate()
             .map(|(i, m)| format!(
                 "[{}] ({},{}) {}x{}",
-                i,
-                m.work.x,
-                m.work.y,
-                m.work.w,
-                m.work.h
+                i, m.work.x, m.work.y, m.work.w, m.work.h
             ))
             .collect::<Vec<_>>()
             .join(", ")
     );
 
-    let mut focused: Option<WindowId> = None;
-    // 直前のモニター跨ぎフォーカス追従の記録 (前フォーカス窓, 時刻)。
-    // 追従直後にその前フォーカス窓が消えた場合、それは「閉じたことによる
-    // OS の Z 順フォールバックへの追従」だったと分かるので巻き戻す
-    // (Firefox のように前面を手放してから遅れて窓を破棄するアプリ対策)
-    let mut cross_follow: Option<(WindowId, Instant)> = None;
-    // 閉じイベントで後継フォーカスを選んだ直後の防衛 (後継窓, 時刻)。
-    // 閉じたアプリが複数の削除系イベントを出す場合、後継決定の後から OS の
-    // Z 順フォールバック前面化が届くことがある。防衛時間内の別モニターへの
-    // 前面化は stale とみなして無視し、後継を再主張する
-    let mut focus_guard: Option<(WindowId, Instant)> = None;
+    // Core (emakiwm_core::state) へ渡す単調時刻 (ms) の起点
+    let epoch = Instant::now();
+    let now_ms = || epoch.elapsed().as_millis() as u64;
+
     let mut visual: HashMap<u64, Rect> = HashMap::new();
     let mut borders: HashMap<u64, Border> = HashMap::new();
-    let mut fullscreen: Option<u64> = None;
     let mut subscribers: Vec<mpsc::Sender<String>> = Vec::new();
     let mut last_state = String::new();
     let mut bordered: Option<u64> = None;
     let mut pinned: Vec<u64> = Vec::new();
+    // FR-3.6 の実サイズ読み戻し: 現在のレイアウト変化について残り何回確認するかと、
+    // 次に確認する時刻 (None = 予定なし)
+    let mut size_checks_done = 0usize;
+    let mut size_check_at: Option<Instant> = None;
+    // 読み戻しで判明したウィンドウごとの最小幅 (FR-3.6)
+    let mut min_widths: HashMap<u64, i32> = HashMap::new();
 
     // FR-1.1: 起動時スキャン。モニターごとに左端 x 順に並べてタイル化する
     let all_initial: Vec<scan::ScanEntry> = {
@@ -179,29 +194,13 @@ pub fn run() {
             .filter(|e| unsafe { !IsIconic(HWND(e.hwnd as _)).as_bool() })
             .collect();
         // (monitor_index, rect.left) でソートして各モニター内の左→右順を保つ
-        let mon_ref = &monitors;
-        v.sort_by_key(|e| {
-            let mi = monitor_for_window(e.hwnd, mon_ref);
-            (mi, e.rect.left)
-        });
+        v.sort_by_key(|e| (monitor_for_window(e.hwnd, &state.monitors), e.rect.left));
         v
     };
     for e in &all_initial {
-        let mi = monitor_for_window(e.hwnd, &monitors);
-        let (work, dw) = {
-            let ms = &monitors[mi];
-            (ms.work, ms.default_width)
-        };
-        adopt(
-            &mut monitors[mi].stack,
-            &mut visual,
-            &mut borders,
-            e,
-            dw,
-            cfg.gap,
-            None,
-            work,
-        );
+        let mi = monitor_for_window(e.hwnd, &state.monitors);
+        register_window(&mut visual, &mut borders, e, state.monitors[mi].work);
+        state.adopt_initial(mi, WindowId(e.hwnd as u64));
         tracing::info!(
             "adopt {:#x} {} \"{}\" → monitor {}",
             e.hwnd,
@@ -220,33 +219,21 @@ pub fn run() {
         shell_spawn(cmd);
     }
 
-    let fg = WindowId(unsafe { GetForegroundWindow() }.0 as u64);
-    if let Some(mi) = monitor_index_of(fg, &monitors) {
-        active_monitor = mi;
-        focused = Some(fg);
-        let ms = &mut monitors[active_monitor];
-        let strip = ms.stack.active_mut();
-        strip.set_active(fg);
-        strip.last_focused = Some(fg);
-    }
+    state.set_initial_focus(WindowId(unsafe { GetForegroundWindow() }.0 as u64));
 
     tracing::info!(
         "managing {} windows on {} monitor(s). Ctrl+C / Alt+Shift+E で終了",
-        monitors
-            .iter()
-            .flat_map(|ms| ms.stack.strips.iter())
-            .map(|s| s.columns.len())
-            .sum::<usize>(),
-        monitors.len()
+        state.window_count(),
+        state.monitors.len()
     );
 
-    let mut own_map = own_monitor_map(&monitors);
-    let mut last_targets = targets_all(&monitors, fullscreen, cfg.gap);
+    let mut own_map = own_monitor_map(&state.monitors);
+    let mut last_targets = targets(&state);
     let mut anim = start_transition(
         &mut visual,
         &last_targets,
         &own_map,
-        &monitors,
+        &state.monitors,
         &borders,
         cfg.cloak,
     );
@@ -254,17 +241,22 @@ pub fn run() {
     'main: loop {
         // deferred になった uncloak の再試行。残っている間はフレーム間隔で回す
         let pending_uncloak = retry_pending_uncloaks();
-        let ev = if anim.is_some() || pending_uncloak {
-            match rx.recv_timeout(FRAME) {
+        // 起きる必要がある時刻まで待つ。何もなければイベントが来るまでブロックする
+        let timeout = if anim.is_some() || pending_uncloak {
+            Some(FRAME)
+        } else {
+            size_check_at.map(|t| t.saturating_duration_since(Instant::now()))
+        };
+        let ev = match timeout {
+            Some(d) => match rx.recv_timeout(d) {
                 Ok(ev) => Some(ev),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match rx.recv() {
+            },
+            None => match rx.recv() {
                 Ok(ev) => Some(ev),
                 Err(_) => break,
-            }
+            },
         };
 
         if let Some(ev) = ev {
@@ -272,414 +264,162 @@ pub fn run() {
                 WmEvent::Query(_) | WmEvent::Subscribe(_) => {}
                 e => tracing::debug!("event: {e:?}"),
             }
-            match ev {
-                // どこかの Stack が既に管理中なら何もしない。物理位置ベースで
-                // adopt すると、退避・アニメ中に他モニター上で UNCLOAKED/SHOW が
-                // 発火したとき別モニターの Stack へ二重登録されてしまう
-                WmEvent::Appeared(h) | WmEvent::MinimizeEnd(h)
-                    if monitor_index_of(WindowId(h as u64), &monitors).is_some() => {}
+            // 論理状態が変わらなくても定位置へ配置し直す (手動で動かされた場合)
+            let mut resnap = false;
+            // 状態遷移は Core (State) が行い、前面化すべきウィンドウを返す
+            let focus_request: Option<WindowId> = match ev {
                 WmEvent::Appeared(h) | WmEvent::MinimizeEnd(h) => {
-                    // 新規ウィンドウは物理的な出現位置 (アプリ任せ ≒ プライマリ) では
-                    // なく、フォーカスのあるモニターへ取り込む
-                    let mi = active_monitor;
-                    let work = monitors[mi].work;
-                    let dw = monitors[mi].default_width;
-                    let local_focused = focused.filter(|f| monitors[mi].stack.contains(*f));
-                    if try_adopt(
-                        &mut monitors[mi].stack,
-                        &mut visual,
-                        &mut borders,
-                        h,
-                        dw,
-                        cfg.gap,
-                        &cfg.rules,
-                        local_focused,
-                        work,
-                    ) {
-                        active_monitor = mi;
-                        let id = WindowId(h as u64);
-                        focused = Some(id);
-                        let ms = &mut monitors[active_monitor];
-                        let vw = ms.viewport_w;
-                        let strip = ms.stack.active_mut();
-                        strip.set_active(id);
-                        strip.last_focused = Some(id);
-                        strip.ensure_visible(id, vw);
-                        focus_window(h);
+                    let id = WindowId(h as u64);
+                    // どこかの Stack が既に管理中なら何もしない。物理位置ベースで
+                    // adopt すると、退避・アニメ中に他モニター上で UNCLOAKED/SHOW が
+                    // 発火したとき別モニターの Stack へ二重登録されてしまう
+                    if state.monitor_index_of(id).is_some() {
+                        None
+                    } else if let Some(e) = inspect_manageable(h, &cfg.rules) {
+                        let work = state.monitors[state.active_monitor].work;
+                        register_window(&mut visual, &mut borders, &e, work);
+                        let focus = state.adopt(id);
                         persist_restore_rects();
                         if let Some(c) = border_colors(&cfg) {
                             set_border_color(h as u64, c.1);
                         }
+                        focus
+                    } else {
+                        None
                     }
                 }
-                WmEvent::Cloaked(h) if cloaked_by_us(h as u64) || !window_cloaked(h) => {}
+                WmEvent::Cloaked(h) if cloaked_by_us(h as u64) || !window_cloaked(h) => None,
                 WmEvent::Gone(h) | WmEvent::MinimizeStart(h) | WmEvent::Cloaked(h) => {
-                    let id = WindowId(h as u64);
-                    if let Some(mi) = monitor_index_of(id, &monitors) {
-                        let ms = &mut monitors[mi];
-                        if let Some(si) = ms.stack.strip_index_of(id) {
-                            let vw = ms.viewport_w;
-                            // 消えた窓が「直前のモニター跨ぎ追従の前フォーカス窓」なら、
-                            // その追従は OS フォールバックだった → 巻き戻し対象
-                            let fallback_rollback = cross_follow.is_some_and(|(p, t)| {
-                                p == id && t.elapsed() < Duration::from_millis(800)
-                            });
-                            if fallback_rollback {
-                                tracing::debug!(
-                                    "remove {h:#x}: 直前のモニター跨ぎ追従を巻き戻す"
-                                );
+                    match state.remove(WindowId(h as u64), now_ms()) {
+                        Some(removal) => {
+                            if removal.rolled_back {
+                                tracing::debug!("remove {h:#x}: 直前のモニター跨ぎ追従を巻き戻す");
                             }
-                            let was_focused = focused == Some(id) || fallback_rollback;
-                            if cross_follow.is_some_and(|(p, _)| p == id) {
-                                cross_follow = None;
-                            }
-                            let strip = &mut ms.stack.strips[si];
-                            // 後継候補: 同じ位置の列 (末尾なら左隣) の active Tile。
-                            // 縦スタック内で消えた場合は同列の残りが繰り上がる
-                            let col_hint = strip.column_index_of(id);
-                            strip.remove_window(id, cfg.gap);
-                            strip.clamp_offset(vw);
-                            if strip.last_focused == Some(id) {
-                                strip.last_focused = None;
-                            }
-                            let succ = was_focused
-                                .then(|| {
-                                    let cols = &strip.columns;
-                                    col_hint
-                                        .and_then(|i| cols.get(i.min(cols.len().checked_sub(1)?)))
-                                        .and_then(|c| c.active())
-                                })
-                                .flatten();
-                            ms.stack.normalize();
-                            // フォーカス窓の消滅はモニター内で完結させる:
-                            // 同モニターの後継へフォーカスを移す (OS の Z 順
-                            // フォールバックで別モニターへ飛ばさない)
-                            if was_focused {
-                                let strip = ms.stack.active_mut();
-                                let succ = succ
-                                    .filter(|s| strip.contains(*s))
-                                    .or_else(|| {
-                                        strip.last_focused.filter(|f| strip.contains(*f))
-                                    })
-                                    .or_else(|| {
-                                        strip.columns.first().and_then(|c| c.active())
-                                    });
-                                if let Some(s) = succ {
-                                    active_monitor = mi;
-                                    focused = Some(s);
-                                    strip.set_active(s);
-                                    strip.last_focused = Some(s);
-                                    strip.ensure_visible(s, vw);
-                                    focus_window(s.0 as isize);
-                                    focus_guard = Some((s, Instant::now()));
+                            tracing::info!("remove {h:#x}");
+                            visual.remove(&(h as u64));
+                            borders.remove(&(h as u64));
+                            cloak_set(h as u64, Hide::Show);
+                            undim_window(h as u64);
+                            pinned.retain(|&x| x != h as u64);
+                            min_widths.remove(&(h as u64));
+                            if !unsafe { IsWindow(Some(HWND(h as _))).as_bool() } {
+                                if let Some(m) = RESTORE_RECTS.lock().unwrap().as_mut() {
+                                    m.remove(&h);
                                 }
                             }
+                            persist_restore_rects();
+                            removal.focus
                         }
-                        tracing::info!("remove {h:#x}");
-                        visual.remove(&(h as u64));
-                        borders.remove(&(h as u64));
-                        cloak_set(h as u64, Hide::Show);
-                        undim_window(h as u64);
-                        pinned.retain(|&x| x != h as u64);
-                        if fullscreen == Some(h as u64) {
-                            fullscreen = None;
-                        }
-                        if focused == Some(id) {
-                            focused = None;
-                        }
-                        if !unsafe { IsWindow(Some(HWND(h as _))).as_bool() } {
-                            if let Some(m) = RESTORE_RECTS.lock().unwrap().as_mut() {
-                                m.remove(&h);
-                            }
-                        }
-                        persist_restore_rects();
+                        None => None,
                     }
                 }
                 WmEvent::Foreground(h) => {
-                    let id = WindowId(h as u64);
-                    // 後継フォーカスの防衛: 閉じ処理で後継を選んだ直後に届く
-                    // 別モニターへの stale なフォールバック前面化は無視して再主張
-                    let mut guarded = false;
-                    if let Some((succ, t)) = focus_guard {
-                        if t.elapsed() >= Duration::from_millis(500) || id == succ {
-                            focus_guard = None;
-                        } else if monitor_index_of(id, &monitors)
-                            .is_some_and(|mi| mi != active_monitor)
-                        {
-                            tracing::debug!(
-                                "foreground {h:#x}: 閉じ直後の stale フォールバックを無視、後継 {:#x} を再主張",
-                                succ.0
-                            );
-                            focus_window(succ.0 as isize);
-                            guarded = true;
-                        }
+                    let focused_dead = state.focused.is_some_and(|f| unsafe {
+                        let hw = HWND(f.0 as _);
+                        !IsWindow(Some(hw)).as_bool() || IsIconic(hw).as_bool()
+                    });
+                    let reassert = state.foreground(WindowId(h as u64), focused_dead, now_ms());
+                    if let Some(succ) = reassert {
+                        tracing::debug!(
+                            "foreground {h:#x}: 閉じ直後の stale フォールバックを無視、後継 {:#x} を再主張",
+                            succ.0
+                        );
                     }
-                    // フォーカス窓が消滅/最小化した直後に OS が Z 順で別モニターの
-                    // 窓を前面化するフォールバックには追従しない
-                    // (Gone/MinimizeStart 側がモニター内の後継へフォーカスを移す)
-                    let os_fallback = monitor_index_of(id, &monitors)
-                        .is_some_and(|mi| mi != active_monitor)
-                        && focused.is_some_and(|f| unsafe {
-                            let hw = HWND(f.0 as _);
-                            !IsWindow(Some(hw)).as_bool() || IsIconic(hw).as_bool()
-                        });
-                    if guarded || os_fallback {
-                        if os_fallback {
-                            tracing::debug!("foreground {h:#x}: OS フォールバックとして無視");
-                        }
-                    } else if let Some(mi) = monitor_index_of(id, &monitors) {
-                        if mi != active_monitor {
-                            cross_follow = focused.map(|f| (f, Instant::now()));
-                        }
-                        active_monitor = mi;
-                        let ms = &mut monitors[active_monitor];
-                        // 別ワークスペースのウィンドウなら切替えて追従
-                        if let Some(si) = ms.stack.strip_index_of(id) {
-                            if si != ms.stack.active {
-                                tracing::debug!(
-                                    "foreground follow: monitor {mi} ws {} → {si}",
-                                    ms.stack.active
-                                );
-                            }
-                            ms.stack.active = si;
-                        }
-                        focused = Some(id);
-                        let vw = ms.viewport_w;
-                        let strip = ms.stack.active_mut();
-                        strip.set_active(id);
-                        strip.last_focused = Some(id);
-                        strip.ensure_visible(id, vw);
-                    }
+                    reassert
                 }
-                WmEvent::Focus(dir) => {
-                    let ms = &mut monitors[active_monitor];
-                    let vw = ms.viewport_w;
-                    let strip = ms.stack.active_mut();
-                    let target = match focused.filter(|f| strip.contains(*f)) {
-                        Some(cur) => strip.neighbor(cur, dir),
-                        None => strip.columns.first().and_then(|c| c.active()),
-                    };
-                    match target {
-                        Some(t) => {
-                            focused = Some(t);
-                            strip.set_active(t);
-                            strip.last_focused = Some(t);
-                            strip.ensure_visible(t, vw);
-                            focus_window(t.0 as isize);
-                        }
-                        None if dir == FocusDir::Down => {
-                            switch_workspace(&mut ms.stack, &mut focused, true)
-                        }
-                        None if dir == FocusDir::Up => {
-                            switch_workspace(&mut ms.stack, &mut focused, false)
-                        }
-                        None => {}
-                    }
-                }
+                WmEvent::Focus(dir) => state.focus(dir),
                 WmEvent::MoveColumn(dir) => {
-                    if let Some(f) = focused {
-                        let ms = &mut monitors[active_monitor];
-                        let vw = ms.viewport_w;
-                        let strip = ms.stack.active_mut();
-                        if strip.move_column(f, dir, cfg.gap) {
-                            strip.ensure_visible(f, vw);
-                        }
-                    }
+                    state.move_column(dir);
+                    None
                 }
                 WmEvent::Expel => {
-                    if let Some(f) = focused {
-                        let ms = &mut monitors[active_monitor];
-                        let vw = ms.viewport_w;
-                        let strip = ms.stack.active_mut();
-                        if strip.expel(f, cfg.gap) {
-                            strip.ensure_visible(f, vw);
-                        }
-                    }
+                    state.expel();
+                    None
                 }
                 WmEvent::Consume => {
-                    if let Some(f) = focused {
-                        monitors[active_monitor].stack.active_mut().consume_right(f, cfg.gap);
-                    }
+                    state.consume();
+                    None
                 }
                 WmEvent::MoveToWorkspace(down) => {
-                    if let Some(f) = focused {
-                        let ms = &mut monitors[active_monitor];
-                        let vw = ms.viewport_w;
-                        let dw = ms.default_width;
-                        if ms.stack.move_window(f, down, dw, vw, cfg.gap) {
-                            let strip = ms.stack.active_mut();
-                            strip.set_active(f);
-                            strip.ensure_visible(f, vw);
-                        }
-                    }
+                    state.move_to_workspace(down);
+                    None
                 }
-                WmEvent::SwitchWorkspace(down) => {
-                    let ms = &mut monitors[active_monitor];
-                    switch_workspace(&mut ms.stack, &mut focused, down);
-                }
+                WmEvent::SwitchWorkspace(down) => state.switch_workspace(down),
                 WmEvent::CycleWidth => {
-                    if let Some(f) = focused {
-                        let ms = &mut monitors[active_monitor];
-                        let vw = ms.viewport_w;
-                        let strip = ms.stack.active_mut();
-                        if strip.cycle_width(f, vw, cfg.gap) {
-                            strip.ensure_visible(f, vw);
-                        }
-                    }
+                    state.cycle_width();
+                    None
                 }
                 WmEvent::MaximizeColumn => {
-                    if let Some(f) = focused {
-                        let ms = &mut monitors[active_monitor];
-                        let vw = ms.viewport_w;
-                        let strip = ms.stack.active_mut();
-                        if strip.toggle_maximize(f, vw, cfg.gap) {
-                            strip.ensure_visible(f, vw);
-                        }
-                    }
+                    state.maximize_column();
+                    None
                 }
                 WmEvent::Fullscreen => {
-                    if let Some(f) = focused {
-                        fullscreen = (fullscreen != Some(f.0)).then_some(f.0);
-                    }
+                    state.toggle_fullscreen();
+                    None
                 }
                 WmEvent::Scroll(forward) => {
-                    let ms = &mut monitors[active_monitor];
-                    let vw = ms.viewport_w;
-                    ms.stack.active_mut().scroll_columnwise(forward, vw);
+                    state.scroll(forward);
+                    None
                 }
-                WmEvent::CloseFocused => {
-                    if let Some(f) = focused {
-                        unsafe {
-                            let _ = PostMessageW(
-                                Some(HWND(f.0 as _)),
-                                WM_CLOSE,
-                                WPARAM(0),
-                                LPARAM(0),
-                            );
+                // ユーザーによる手動移動・リサイズの完了 (FR-1.2)。リサイズ後の幅は
+                // Column 幅として採用し、位置はタイルの定位置へ戻す
+                WmEvent::MoveSizeEnd(h) => {
+                    let id = WindowId(h as u64);
+                    if state.monitor_index_of(id).is_some() {
+                        if let Some(actual) = frame_rect(h) {
+                            let target_w = last_targets
+                                .iter()
+                                .find(|(t, _)| *t == h as u64)
+                                .map(|(_, r)| r.w);
+                            if state.fullscreen != Some(id)
+                                && target_w.is_some_and(|w| (actual.w - w).abs() > SIZE_TOLERANCE)
+                            {
+                                state.resize_column(id, actual.w);
+                            }
+                            // 手動リサイズの結果は最小幅の記録より信頼できる
+                            min_widths.remove(&(h as u64));
+                            visual.insert(h as u64, actual);
+                            resnap = true;
                         }
                     }
+                    None
+                }
+                WmEvent::CloseFocused => {
+                    if let Some(h) = close_target(&state) {
+                        unsafe {
+                            let _ =
+                                PostMessageW(Some(HWND(h as _)), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                    None
                 }
                 WmEvent::Spawn(cmd) => {
                     shell_spawn(&cmd);
+                    None
                 }
                 WmEvent::ToggleOpacity => {
-                    if let Some(f) = focused {
+                    if let Some(f) = state.focused {
                         if let Some(i) = pinned.iter().position(|&x| x == f.0) {
                             pinned.swap_remove(i);
                         } else {
                             pinned.push(f.0);
                         }
                     }
+                    None
                 }
-                WmEvent::FocusMonitor(forward) => {
-                    let n = monitors.len();
-                    if n > 1 {
-                        let new_m = if forward {
-                            (active_monitor + 1) % n
-                        } else {
-                            if active_monitor == 0 { n - 1 } else { active_monitor - 1 }
-                        };
-                        if new_m != active_monitor {
-                            active_monitor = new_m;
-                            let ms = &mut monitors[active_monitor];
-                            let vw = ms.viewport_w;
-                            let strip = ms.stack.active_mut();
-                            let f = strip
-                                .last_focused
-                                .filter(|f| strip.contains(*f))
-                                .or_else(|| strip.columns.first().and_then(|c| c.active()));
-                            focused = f;
-                            if let Some(f) = f {
-                                strip.set_active(f);
-                                strip.ensure_visible(f, vw);
-                                focus_window(f.0 as isize);
-                            }
-                        }
-                    }
-                }
-                WmEvent::MoveToMonitor(forward) => {
-                    if let Some(f) = focused {
-                        if let Some(src_mi) = monitor_index_of(f, &monitors) {
-                            let n = monitors.len();
-                            if n > 1 {
-                                let dst_mi = if forward {
-                                    (src_mi + 1) % n
-                                } else {
-                                    if src_mi == 0 { n - 1 } else { src_mi - 1 }
-                                };
-                                // ソース側から除去
-                                {
-                                    let ms = &mut monitors[src_mi];
-                                    let vw = ms.viewport_w;
-                                    if let Some(si) = ms.stack.strip_index_of(f) {
-                                        ms.stack.strips[si].remove_window(f, cfg.gap);
-                                        ms.stack.strips[si].clamp_offset(vw);
-                                        if ms.stack.strips[si].last_focused == Some(f) {
-                                            ms.stack.strips[si].last_focused = None;
-                                        }
-                                    }
-                                    ms.stack.normalize();
-                                }
-                                // 宛先側へ追加
-                                {
-                                    let ms = &mut monitors[dst_mi];
-                                    let dw = ms.default_width;
-                                    let anchor = ms.stack.active_mut().last_focused;
-                                    ms.stack.active_mut().insert_column_after(
-                                        anchor, f, dw, cfg.gap,
-                                    );
-                                    ms.stack.active_mut().last_focused = Some(f);
-                                    ms.stack.normalize();
-                                }
-                                active_monitor = dst_mi;
-                                focused = Some(f);
-                                let ms = &mut monitors[active_monitor];
-                                let vw = ms.viewport_w;
-                                ms.stack.active_mut().set_active(f);
-                                ms.stack.active_mut().ensure_visible(f, vw);
-                                focus_window(f.0 as isize);
-                            }
-                        }
-                    }
-                }
+                WmEvent::FocusMonitor(forward) => state.focus_monitor(forward),
+                WmEvent::MoveToMonitor(forward) => state.move_to_monitor(forward),
                 WmEvent::Reload => {
                     cfg = config::load();
                     events::set_mouse_scroll_focus(cfg.mouse_scroll_focus);
-                    // モニター作業領域を更新
-                    let raw = collect_monitors();
-                    let (top, right, bottom, left) = cfg.margin;
-                    let gap = cfg.gap;
-                    for ms in &mut monitors {
-                        if let Some((_, mi)) = raw.iter().find(|(h, _)| *h == ms.hmonitor) {
-                            let mut work = to_rect(mi.rcWork);
-                            work.x += left;
-                            work.y += top;
-                            work.w = (work.w - left - right).max(200);
-                            work.h = (work.h - top - bottom).max(200);
-                            ms.work = work;
-                            ms.monitor = to_rect(mi.rcMonitor);
-                            ms.viewport_w = work.w - 2 * gap;
-                            ms.default_width =
-                                ((ms.viewport_w - gap) as f32 * cfg.default_ratio) as i32;
-                        }
-                        for s in &mut ms.stack.strips {
-                            s.relayout(cfg.gap);
-                            s.clamp_offset(ms.viewport_w);
-                        }
-                    }
+                    state.reconfigure(&monitor_geoms(&cfg), cfg.gap, cfg.default_ratio);
                     if !cfg.cloak {
                         uncloak_all();
                     }
                     undim_all();
                     let unfocused = border_colors(&cfg).map_or(BORDER_DEFAULT, |c| c.1);
-                    for ms in &monitors {
-                        for s in &ms.stack.strips {
-                            for col in &s.columns {
-                                for t in &col.tiles {
-                                    set_border_color(t.0, unfocused);
-                                }
-                            }
-                        }
+                    for h in own_monitor_map(&state.monitors).into_keys() {
+                        set_border_color(h, unfocused);
                     }
                     bordered = None;
                     tracing::info!(
@@ -689,122 +429,56 @@ pub fn run() {
                         cfg.rules.len(),
                         cfg.cloak
                     );
+                    None
                 }
                 WmEvent::WorkAreaChanged => {
-                    // モニター構成の再取得
-                    let raw = collect_monitors();
-                    let (top, right, bottom, left) = cfg.margin;
-                    let gap = cfg.gap;
-
-                    // 既存モニターを更新し、消えたモニターを検出
-                    let mut orphaned: Vec<WindowId> = Vec::new();
-                    monitors.retain(|ms| {
-                        if raw.iter().any(|(h, _)| *h == ms.hmonitor) {
-                            true
-                        } else {
-                            // 消えたモニターのウィンドウを回収
-                            for strip in &ms.stack.strips {
-                                for col in &strip.columns {
-                                    orphaned.extend_from_slice(&col.tiles);
-                                }
-                            }
-                            false
-                        }
-                    });
-
-                    let existing_hmons: Vec<isize> =
-                        monitors.iter().map(|ms| ms.hmonitor).collect();
-                    for (h, mi) in &raw {
-                        if existing_hmons.contains(h) {
-                            // 作業領域更新
-                            if let Some(ms) = monitors.iter_mut().find(|m| m.hmonitor == *h) {
-                                let mut work = to_rect(mi.rcWork);
-                                work.x += left;
-                                work.y += top;
-                                work.w = (work.w - left - right).max(200);
-                                work.h = (work.h - top - bottom).max(200);
-                                if work != ms.work || to_rect(mi.rcMonitor) != ms.monitor {
-                                    ms.work = work;
-                                    ms.monitor = to_rect(mi.rcMonitor);
-                                    ms.viewport_w = work.w - 2 * gap;
-                                    ms.default_width =
-                                        ((ms.viewport_w - gap) as f32 * cfg.default_ratio) as i32;
-                                }
-                            }
-                        } else {
-                            // 新規モニター
-                            let mut work = to_rect(mi.rcWork);
-                            work.x += left;
-                            work.y += top;
-                            work.w = (work.w - left - right).max(200);
-                            work.h = (work.h - top - bottom).max(200);
-                            let vw = work.w - 2 * gap;
-                            let dw = ((vw - gap) as f32 * cfg.default_ratio) as i32;
-                            monitors.push(MonitorState {
-                                hmonitor: *h,
-                                work,
-                                monitor: to_rect(mi.rcMonitor),
-                                viewport_w: vw,
-                                default_width: dw,
-                                stack: Stack::default(),
-                            });
-                        }
+                    // WM_SETTINGCHANGE はノイズが多いので、構成が変わったときだけログする
+                    let before = state.monitors.len();
+                    state.reconfigure(&monitor_geoms(&cfg), cfg.gap, cfg.default_ratio);
+                    if state.monitors.len() != before {
+                        tracing::info!("work area changed: {} monitor(s)", state.monitors.len());
                     }
-
-                    monitors.sort_by_key(|m| (m.work.x, m.work.y));
-                    active_monitor = active_monitor.min(monitors.len().saturating_sub(1));
-
-                    // 孤立ウィンドウを active_monitor へ移す
-                    for id in orphaned {
-                        let ms = &mut monitors[active_monitor];
-                        let dw = ms.default_width;
-                        ms.stack.active_mut().insert_column_after(None, id, dw, gap);
-                    }
-                    if !monitors.is_empty() {
-                        monitors[active_monitor].stack.normalize();
-                    }
-
-                    for ms in &mut monitors {
-                        for s in &mut ms.stack.strips {
-                            s.relayout(cfg.gap);
-                            s.clamp_offset(ms.viewport_w);
-                        }
-                    }
-
-                    tracing::info!(
-                        "work area changed: {} monitor(s)",
-                        monitors.len()
-                    );
+                    None
                 }
                 WmEvent::Query(reply) => {
-                    let _ = reply
-                        .send(state_json(&monitors, active_monitor, focused, fullscreen));
+                    let _ = reply.send(state_json(&state));
+                    None
                 }
                 WmEvent::Subscribe(s) => {
-                    last_state = state_json(&monitors, active_monitor, focused, fullscreen);
+                    last_state = state_json(&state);
                     if s.send(last_state.clone()).is_ok() {
                         subscribers.push(s);
                     }
+                    None
                 }
                 WmEvent::Shutdown => break 'main,
+            };
+            if let Some(f) = focus_request {
+                focus_window(f.0 as isize);
             }
 
-            own_map = own_monitor_map(&monitors);
-            let new_targets = targets_all(&monitors, fullscreen, cfg.gap);
-            if new_targets != last_targets {
+            own_map = own_monitor_map(&state.monitors);
+            // 既知の最小幅を下回る Column は配置前に広げておく (重なりを一瞬も見せない)
+            for (&h, &w) in &min_widths {
+                state.grow_column(WindowId(h), w);
+            }
+            let new_targets = targets(&state);
+            if new_targets != last_targets || resnap {
+                size_checks_done = 0;
+                size_check_at = None;
                 last_targets = new_targets;
                 anim = start_transition(
                     &mut visual,
                     &last_targets,
                     &own_map,
-                    &monitors,
+                    &state.monitors,
                     &borders,
                     cfg.cloak,
                 );
             }
 
             if let Some((focused_color, unfocused_color)) = border_colors(&cfg) {
-                let cur = focused.map(|f| f.0);
+                let cur = state.focused.map(|f| f.0);
                 if cur != bordered {
                     if let Some(prev) = bordered {
                         set_border_color(prev, unfocused_color);
@@ -817,7 +491,7 @@ pub fn run() {
             }
 
             if !subscribers.is_empty() {
-                let s = state_json(&monitors, active_monitor, focused, fullscreen);
+                let s = state_json(&state);
                 if s != last_state {
                     last_state = s;
                     subscribers.retain(|sub| sub.send(last_state.clone()).is_ok());
@@ -825,7 +499,10 @@ pub fn run() {
             }
         }
 
+        let fullscreen = state.fullscreen.map(|f| f.0);
+
         // フレーム描画
+        let mut settled = false;
         if let Some((entries, started)) = &anim {
             let t_raw = if cfg.anim.is_zero() {
                 1.0
@@ -844,7 +521,7 @@ pub fn run() {
             // 失敗しやすくなるため)。Full は静止後の一括判定でのみ適用する
             if cfg.cloak {
                 for &(h, r) in &frame {
-                    let level = match hide_level(h, r, &own_map, &monitors) {
+                    let level = match hide_level(h, r, &own_map, &state.monitors) {
                         Hide::Full => Hide::Render,
                         l => l,
                     };
@@ -856,6 +533,7 @@ pub fn run() {
             }
             if t_raw >= 1.0 {
                 anim = None;
+                settled = true;
                 // アニメーションの終点はモニター縁のすぐ外にクランプされている。
                 // 完了後、本来の退避先 (全モニター外) へ不可視のままスナップする
                 let settles: Vec<(u64, Rect)> = last_targets
@@ -872,11 +550,34 @@ pub fn run() {
             }
         }
 
+        // FR-3.6: 最小サイズ制約で要求より広くなったウィンドウは、実幅を Column 幅へ
+        // 読み戻して隣との重なりを解消する。配置完了時に加え、要求サイズを一旦
+        // 受け入れてから遅れて広がり直すアプリのために少し後にも確認する。
+        // 確認は 1 回のレイアウト変化につき SIZE_RECHECK_MS.len() + 1 回まで (ループ防止)
+        let due = anim.is_none() && size_check_at.is_some_and(|t| Instant::now() >= t);
+        if (settled || due) && size_checks_done <= SIZE_RECHECK_MS.len() {
+            size_check_at = SIZE_RECHECK_MS
+                .get(size_checks_done)
+                .map(|ms| Instant::now() + Duration::from_millis(*ms));
+            size_checks_done += 1;
+            if read_back_sizes(&mut state, &last_targets, &own_map, &mut min_widths) {
+                last_targets = targets(&state);
+                anim = start_transition(
+                    &mut visual,
+                    &last_targets,
+                    &own_map,
+                    &state.monitors,
+                    &borders,
+                    cfg.cloak,
+                );
+            }
+        }
+
         // cloak モード: アニメーション完了後、自モニターに写らないウィンドウを隠す。
         // active ワークスペースの viewport 外は Alt+Tab に残す (Hide::Render)
         if cfg.cloak && anim.is_none() {
             for &(h, r) in &last_targets {
-                let level = hide_level(h, r, &own_map, &monitors);
+                let level = hide_level(h, r, &own_map, &state.monitors);
                 cloak_set(h, level);
                 if level == Hide::Show && window_cloaked(h as isize) {
                     shell_cloak(h, false);
@@ -886,7 +587,7 @@ pub fn run() {
 
         // FR-3.8: 非フォーカスウィンドウの半透明化
         if cfg.unfocused_alpha.is_some() || !pinned.is_empty() {
-            let f = focused.map(|f| f.0);
+            let f = state.focused.map(|f| f.0);
             for &(h, _) in &last_targets {
                 let alpha = if pinned.contains(&h) {
                     cfg.pinned_alpha
@@ -916,13 +617,17 @@ pub fn run() {
                 };
                 // 自モニターの外にいる間は枠も描かない (他モニターへのゴースト防止)
                 let visible = match own_map.get(&h) {
-                    Some(&mi) => intersects(r, monitors[mi].work),
-                    None => intersects_any(r, &monitors),
+                    Some(&mi) => intersects(r, state.monitors[mi].work),
+                    None => intersects_any(r, &state.monitors),
                 };
                 if !visible {
                     continue;
                 }
-                let color = if focused.map(|f| f.0) == Some(h) { fc } else { uc };
+                let color = if state.focused.map(|f| f.0) == Some(h) {
+                    fc
+                } else {
+                    uc
+                };
                 if color >= 0xFFFF_FFFE {
                     continue;
                 }
@@ -957,7 +662,7 @@ fn start_transition(
     visual: &mut HashMap<u64, Rect>,
     targets: &[(u64, Rect)],
     own_map: &HashMap<u64, usize>,
-    monitors: &[MonitorState],
+    monitors: &[Monitor],
     borders: &HashMap<u64, Border>,
     cloak: bool,
 ) -> Option<(Vec<AnimEntry>, Instant)> {
@@ -979,7 +684,11 @@ fn start_transition(
             snaps.push((hwnd, to));
             continue;
         }
-        let a = if vis_from { from } else { clamp_near(from, own) };
+        let a = if vis_from {
+            from
+        } else {
+            clamp_near(from, own)
+        };
         let b = if vis_to { to } else { clamp_near(to, own) };
         let crosses_other = |r: Rect| {
             monitors
@@ -987,13 +696,15 @@ fn start_transition(
                 .enumerate()
                 .any(|(j, ms)| j != mi && intersects(r, ms.monitor))
         };
-        if !cloak
-            && ((!vis_from && crosses_other(a)) || (!vis_to && crosses_other(b)))
-        {
+        if !cloak && ((!vis_from && crosses_other(a)) || (!vis_to && crosses_other(b))) {
             snaps.push((hwnd, to));
             continue;
         }
-        entries.push(AnimEntry { hwnd, from: a, to: b });
+        entries.push(AnimEntry {
+            hwnd,
+            from: a,
+            to: b,
+        });
     }
     if !snaps.is_empty() {
         apply_rects(&snaps, borders);
@@ -1022,7 +733,7 @@ fn clamp_near(r: Rect, own: Rect) -> Rect {
 }
 
 /// hwnd → 所属モニターのインデックス。イベント処理のたびに再構築する。
-fn own_monitor_map(monitors: &[MonitorState]) -> HashMap<u64, usize> {
+fn own_monitor_map(monitors: &[Monitor]) -> HashMap<u64, usize> {
     let mut map = HashMap::new();
     for (i, ms) in monitors.iter().enumerate() {
         for s in &ms.stack.strips {
@@ -1037,19 +748,14 @@ fn own_monitor_map(monitors: &[MonitorState]) -> HashMap<u64, usize> {
 }
 
 /// r がいずれかのモニター作業領域と交差するか (= 画面上に見え得るか)。
-fn intersects_any(r: Rect, monitors: &[MonitorState]) -> bool {
+fn intersects_any(r: Rect, monitors: &[Monitor]) -> bool {
     monitors.iter().any(|ms| intersects(r, ms.work))
 }
 
 /// cloak モードでの隠蔽レベルを決める。
 /// 自モニターに写っていれば表示。写っていない場合、active ワークスペースの
 /// ウィンドウは描画停止のみ (Alt+Tab に残す)、非 active は完全に隠す。
-fn hide_level(
-    h: u64,
-    r: Rect,
-    own_map: &HashMap<u64, usize>,
-    monitors: &[MonitorState],
-) -> Hide {
+fn hide_level(h: u64, r: Rect, own_map: &HashMap<u64, usize>, monitors: &[Monitor]) -> Hide {
     let Some(&mi) = own_map.get(&h) else {
         return Hide::Show;
     };
@@ -1069,91 +775,23 @@ fn intersects(r: Rect, work: Rect) -> bool {
     r.x < work.x + work.w && r.x + r.w > work.x && r.y < work.y + work.h && r.y + r.h > work.y
 }
 
-/// 全モニターのターゲット Rect を結合して返す。
-fn targets_all(
-    monitors: &[MonitorState],
-    fullscreen: Option<u64>,
-    gap: i32,
-) -> Vec<(u64, Rect)> {
-    let bounds = virtual_bounds(monitors);
-    monitors
-        .iter()
-        .flat_map(|ms| {
-            targets_for_monitor(&ms.stack, ms.work, ms.monitor, bounds, fullscreen, gap)
-        })
+/// Core のターゲット Rect を HWND 値キーで返す。
+fn targets(state: &State) -> Vec<(u64, Rect)> {
+    state
+        .targets()
+        .into_iter()
+        .map(|(id, r)| (id.0, r))
         .collect()
 }
 
-/// 全モニターの物理領域を結合したバウンディングボックス。
-/// 退避座標はこの外に取る — モニターが上下・左右どう配置されても
-/// 非 active ワークスペースや offscreen Column が他モニターに写り込まない。
-fn virtual_bounds(monitors: &[MonitorState]) -> Rect {
-    let mut it = monitors.iter().map(|ms| ms.monitor);
-    let Some(first) = it.next() else {
-        return Rect { x: 0, y: 0, w: 1920, h: 1080 };
-    };
-    it.fold(first, |acc, r| {
-        let x = acc.x.min(r.x);
-        let y = acc.y.min(r.y);
-        let right = (acc.x + acc.w).max(r.x + r.w);
-        let bottom = (acc.y + acc.h).max(r.y + r.h);
-        Rect { x, y, w: right - x, h: bottom - y }
-    })
-}
-
-/// 1 モニター分のターゲット Rect を計算する。
-/// active ワークスペースは通常配置、非 active は上下にずらす。
-/// ずらし幅は仮想デスクトップ全体の高さより大きく取り、他モニターと重ねない。
-fn targets_for_monitor(
-    stack: &Stack,
-    work: Rect,
-    monitor: Rect,
-    bounds: Rect,
-    fullscreen: Option<u64>,
-    gap: i32,
-) -> Vec<(u64, Rect)> {
-    let step = bounds.h + work.h + 200;
-    let mut out = Vec::new();
-    for (i, strip) in stack.strips.iter().enumerate() {
-        let dy = (i as i32 - stack.active as i32) * step;
-        for (id, p) in strip.project(work, gap) {
-            let r = if Some(id.0) == fullscreen && i == stack.active {
-                monitor
-            } else {
-                let base = park(p, work, bounds);
-                Rect {
-                    y: base.y + dy,
-                    ..base
-                }
-            };
-            out.push((id.0, r));
-        }
-    }
-    out
-}
-
-/// 新規ウィンドウの管理対象判定と取り込み (FR-1.3)。
-#[allow(clippy::too_many_arguments)]
-fn try_adopt(
-    stack: &mut Stack,
-    visual: &mut HashMap<u64, Rect>,
-    borders: &mut HashMap<u64, Border>,
-    h: isize,
-    width: i32,
-    gap: i32,
-    rules: &[emakiwm_core::filter::Rule],
-    focused: Option<WindowId>,
-    work: Rect,
-) -> bool {
-    if stack.contains(WindowId(h as u64)) {
-        return false;
-    }
+/// 新規ウィンドウが管理対象かを判定する (FR-1.3)。対象ならスキャン結果を返す。
+fn inspect_manageable(h: isize, rules: &[emakiwm_core::filter::Rule]) -> Option<scan::ScanEntry> {
     let e = scan::inspect(HWND(h as _), rules);
     if e.decision != Decision::Manage || e.elevated == Some(true) {
-        return false;
+        return None;
     }
     if unsafe { IsIconic(HWND(h as _)).as_bool() } {
-        return false;
+        return None;
     }
     tracing::info!(
         "adopt {:#x} {} \"{}\"",
@@ -1161,19 +799,15 @@ fn try_adopt(
         e.info.exe_name.as_deref().unwrap_or("?"),
         e.info.title
     );
-    adopt(stack, visual, borders, &e, width, gap, focused, work);
-    true
+    Some(e)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn adopt(
-    stack: &mut Stack,
+/// 取り込むウィンドウの Win32 側の付帯情報を記録する
+/// (復元 Rect・不可視フレーム・現在位置)。論理状態への挿入は Core が行う。
+fn register_window(
     visual: &mut HashMap<u64, Rect>,
     borders: &mut HashMap<u64, Border>,
     e: &scan::ScanEntry,
-    width: i32,
-    gap: i32,
-    focused: Option<WindowId>,
     work: Rect,
 ) {
     let h = e.hwnd;
@@ -1192,10 +826,6 @@ fn adopt(
     );
     heal_leftover_alpha(h as u64);
     visual.insert(h as u64, to_rect(frame));
-    stack
-        .active_mut()
-        .insert_column_after(focused, WindowId(h as u64), width, gap);
-    stack.normalize();
 }
 
 fn to_rect(r: RECT) -> Rect {
@@ -1270,28 +900,31 @@ fn apply_individually(rects: &[(u64, Rect)], borders: &HashMap<u64, Border>) {
     }
 }
 
-fn switch_workspace(stack: &mut Stack, focused: &mut Option<WindowId>, down: bool) {
-    if !stack.switch(down) {
-        return;
+/// `close` コマンドの対象。前面ウィンドウが管理外のフロート (ダイアログ等) なら
+/// それを閉じる — `focused` は管理ウィンドウしか追わないため、そのまま使うと
+/// 見えているダイアログではなく背後のタイルを閉じてしまう。
+/// キャプションを持たない前面窓 (デスクトップ・タスクバー等のシェル) は対象外。
+fn close_target(state: &State) -> Option<isize> {
+    let focused = state.focused;
+    let fg = unsafe { GetForegroundWindow() };
+    let fg_id = WindowId(fg.0 as u64);
+    if !fg.is_invalid() && focused != Some(fg_id) {
+        if state.monitor_index_of(fg_id).is_some() {
+            return Some(fg.0 as isize);
+        }
+        let e = scan::inspect(fg, &[]);
+        let caption = emakiwm_core::filter::WS_CAPTION;
+        if !e.info.is_own_process && e.info.is_visible && e.info.style & caption == caption {
+            return Some(fg.0 as isize);
+        }
     }
-    let strip = stack.active_mut();
-    *focused = strip
-        .last_focused
-        .filter(|f| strip.contains(*f))
-        .or_else(|| strip.columns.first().and_then(|c| c.active()));
-    if let Some(f) = *focused {
-        strip.set_active(f);
-        focus_window(f.0 as isize);
-    }
+    focused.map(|f| f.0 as isize)
 }
 
 /// IPC `state` 応答の JSON (FR-7.3)。マルチモニター情報を含む。
-fn state_json(
-    monitors: &[MonitorState],
-    active_monitor: usize,
-    focused: Option<WindowId>,
-    fullscreen: Option<u64>,
-) -> String {
+fn state_json(state: &State) -> String {
+    let monitors = &state.monitors;
+    let active_monitor = state.active_monitor;
     let monitors_json: Vec<_> = monitors
         .iter()
         .map(|ms| {
@@ -1336,8 +969,8 @@ fn state_json(
     serde_json::json!({
         "active_monitor": active_monitor,
         "active_workspace": active_ws_idx,
-        "focused": focused.map(|f| f.0),
-        "fullscreen": fullscreen,
+        "focused": state.focused.map(|f| f.0),
+        "fullscreen": state.fullscreen.map(|f| f.0),
         "workspaces": active_workspaces,
         "monitors": monitors_json,
     })
@@ -1370,68 +1003,25 @@ fn focus_window(h: isize) {
     }
 }
 
-/// Offscreen Column の退避先。仮想デスクトップ全体 (bounds) の外へ出し、
-/// 左右に別モニターがある配置でも隣のモニターに写り込まないようにする。
-fn park(p: Placement, work: Rect, bounds: Rect) -> Rect {
-    match p {
-        Placement::Visible(r) => r,
-        Placement::Offscreen(r) => {
-            let x = if r.x < work.x {
-                bounds.x - r.w - 100
-            } else {
-                bounds.x + bounds.w + 100
-            };
-            Rect { x, ..r }
-        }
-    }
-}
-
-/// 全物理モニターを列挙し MonitorState を生成する (左→右順)。
-fn enumerate_monitors(cfg: &config::Config) -> Vec<MonitorState> {
-    let raw = collect_monitors();
-    let gap = cfg.gap;
+/// 全物理モニターの領域を列挙する。作業領域には設定の margin を適用する。
+/// 列挙に失敗した場合は空を返す。
+fn monitor_geoms(cfg: &config::Config) -> Vec<MonitorGeom> {
     let (top, right, bottom, left) = cfg.margin;
-
-    let mut states: Vec<MonitorState> = raw
+    collect_monitors()
         .into_iter()
-        .map(|(hmon, mi)| {
+        .map(|(hmonitor, mi)| {
             let mut work = to_rect(mi.rcWork);
             work.x += left;
             work.y += top;
             work.w = (work.w - left - right).max(200);
             work.h = (work.h - top - bottom).max(200);
-            let viewport_w = work.w - 2 * gap;
-            let default_width = ((viewport_w - gap) as f32 * cfg.default_ratio) as i32;
-            MonitorState {
-                hmonitor: hmon,
+            MonitorGeom {
+                hmonitor,
                 work,
                 monitor: to_rect(mi.rcMonitor),
-                viewport_w,
-                default_width,
-                stack: Stack::default(),
             }
         })
-        .collect();
-
-    // 左→右、同じ x なら上→下 (上下配置でも順序が安定するように)
-    states.sort_by_key(|m| (m.work.x, m.work.y));
-
-    if states.is_empty() {
-        // フォールバック: プライマリモニターのみ
-        let (work, monitor) = primary_monitor_fallback();
-        let viewport_w = work.w - 2 * gap;
-        let default_width = ((viewport_w - gap) as f32 * cfg.default_ratio) as i32;
-        states.push(MonitorState {
-            hmonitor: 0,
-            work,
-            monitor,
-            viewport_w,
-            default_width,
-            stack: Stack::default(),
-        });
-    }
-
-    states
+        .collect()
 }
 
 /// EnumDisplayMonitors で全モニターの (HMONITOR, MONITORINFO) を収集する。
@@ -1467,17 +1057,12 @@ fn collect_monitors() -> Vec<(isize, MONITORINFO)> {
 }
 
 /// HWND が属するモニターのインデックスを返す (見つからなければ 0)。
-fn monitor_for_window(h: isize, monitors: &[MonitorState]) -> usize {
+fn monitor_for_window(h: isize, monitors: &[Monitor]) -> usize {
     let hmon = unsafe { MonitorFromWindow(HWND(h as _), MONITOR_DEFAULTTONEAREST) };
     monitors
         .iter()
         .position(|m| m.hmonitor == hmon.0 as isize)
         .unwrap_or(0)
-}
-
-/// WindowId がどのモニターの Stack に含まれるかを返す。
-fn monitor_index_of(id: WindowId, monitors: &[MonitorState]) -> Option<usize> {
-    monitors.iter().position(|m| m.stack.contains(id))
 }
 
 /// プライマリモニターのフォールバック (EnumDisplayMonitors 失敗時)。
@@ -1492,7 +1077,12 @@ fn primary_monitor_fallback() -> (Rect, Rect) {
             return (to_rect(mi.rcWork), to_rect(mi.rcMonitor));
         }
     }
-    let fallback = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+    let fallback = Rect {
+        x: 0,
+        y: 0,
+        w: 1920,
+        h: 1080,
+    };
     (fallback, fallback)
 }
 
@@ -1738,6 +1328,54 @@ fn set_toolwindow(h: u64, on: bool) {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new);
         }
     }
+}
+
+/// 可視ウィンドウの実フレーム幅を読み、要求幅より広いものは Column 幅を
+/// 実幅へ広げ、その幅を最小幅として `min_widths` に記録する (FR-3.6)。
+/// 戻り値: 広げた Column があるか。
+fn read_back_sizes(
+    state: &mut State,
+    targets: &[(u64, Rect)],
+    own_map: &HashMap<u64, usize>,
+    min_widths: &mut HashMap<u64, i32>,
+) -> bool {
+    let mut grown = false;
+    for &(h, r) in targets {
+        if state.fullscreen == Some(WindowId(h))
+            || hide_level(h, r, own_map, &state.monitors) != Hide::Show
+            || unsafe { IsZoomed(HWND(h as _)).as_bool() }
+        {
+            continue;
+        }
+        let Some(actual) = frame_rect(h as isize) else {
+            continue;
+        };
+        if actual.w > r.w + SIZE_TOLERANCE && state.grow_column(WindowId(h), actual.w) {
+            tracing::info!(
+                "{h:#x}: 最小サイズ制約により列幅を {} → {} へ",
+                r.w,
+                actual.w
+            );
+            grown = true;
+            min_widths.insert(h, actual.w);
+        }
+    }
+    grown
+}
+
+/// 見た目のフレーム (DWMWA_EXTENDED_FRAME_BOUNDS) の現在位置。
+fn frame_rect(h: isize) -> Option<Rect> {
+    let mut frame = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            HWND(h as _),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut frame as *mut RECT as *mut c_void,
+            size_of::<RECT>() as u32,
+        )
+        .ok()?;
+    }
+    Some(to_rect(frame))
 }
 
 fn window_cloaked(h: isize) -> bool {

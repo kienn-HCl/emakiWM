@@ -25,6 +25,8 @@ pub struct WindowInfo {
     /// GW_OWNER を持つ (ダイアログ等)
     pub has_owner: bool,
     pub is_own_process: bool,
+    /// トップレベルでない (GA_ROOT が自分自身でない)。MDI 子ウィンドウ等
+    pub is_child: bool,
 }
 
 /// 管理対象判定の結果。
@@ -72,11 +74,14 @@ impl Rule {
 }
 
 /// FR-2.1 の除外ルール + FR-2.2 の設定ルールを適用する。
-/// 不可視・自プロセス・cloaked は force-manage でも覆せない
+/// 不可視・子ウィンドウ・自プロセス・cloaked は force-manage でも覆せない
 /// (他仮想デスクトップのウィンドウを掴む事故を防ぐ)。
 pub fn decide(w: &WindowInfo, rules: &[Rule]) -> Decision {
     if !w.is_visible {
         return Decision::Ignore("invisible");
+    }
+    if w.is_child {
+        return Decision::Ignore("child window");
     }
     if w.is_own_process {
         return Decision::Ignore("own process");
@@ -130,6 +135,16 @@ mod tests {
     fn invisible_is_ignored() {
         let w = WindowInfo {
             is_visible: false,
+            ..normal_window()
+        };
+        assert!(matches!(decide(&w, &[]), Decision::Ignore(_)));
+    }
+
+    #[test]
+    fn child_window_is_ignored() {
+        // キャプション + リサイズ枠を持つ MDI 子でも管理しない (FR-1.2.1)
+        let w = WindowInfo {
+            is_child: true,
             ..normal_window()
         };
         assert!(matches!(decide(&w, &[]), Decision::Ignore(_)));

@@ -16,8 +16,9 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+    EnumWindows, GetAncestor, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
+    GW_OWNER,
 };
 
 /// 1 ウィンドウぶんのスキャン結果。
@@ -173,6 +174,7 @@ pub fn inspect(hwnd: HWND, rules: &[Rule]) -> ScanEntry {
             is_cloaked: cloaked != 0,
             has_owner,
             is_own_process,
+            is_child: GetAncestor(hwnd, GA_ROOT) != hwnd,
         };
         let decision = decide(&info, rules);
 

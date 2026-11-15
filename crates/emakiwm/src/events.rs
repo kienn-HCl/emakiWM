@@ -17,13 +17,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, HOT_KEY_MODIFIERS, VK_LMENU, VK_MENU, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageTime, GetMessageW,
-    RegisterClassW, SetWindowsHookExW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetAncestor, GetMessageTime,
+    GetMessageW, RegisterClassW, SetWindowsHookExW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY,
     EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-    OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE,
-    WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
+    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT,
+    WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
 };
 
 use crate::touchpad::GestureBinds;
@@ -41,6 +41,8 @@ pub enum WmEvent {
     Foreground(isize),
     MinimizeStart(isize),
     MinimizeEnd(isize),
+    /// ユーザーによる手動移動・リサイズの完了 (MOVESIZEEND)
+    MoveSizeEnd(isize),
     /// Alt+H/L/J/K (FR-4.1)
     Focus(FocusDir),
     /// Alt+Shift+H/L: Column の並べ替え (FR-4.4)
@@ -192,7 +194,7 @@ pub fn spawn_hook_thread(
 
     std::thread::spawn(move || unsafe {
         // 必要レンジのみフックする (全イベント購読は高コスト):
-        //   0x0003..0x0017: FOREGROUND / MINIMIZESTART / MINIMIZEEND
+        //   0x0003..0x0017: FOREGROUND / MOVESIZEEND / MINIMIZESTART / MINIMIZEEND
         //   0x8001..0x8003: DESTROY / SHOW / HIDE
         //   0x8017..0x8018: CLOAKED / UNCLOAKED
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
@@ -340,12 +342,17 @@ unsafe extern "system" fn win_event_proc(
     }
     let h = hwnd.0 as isize;
     let ev = match event {
+        // 子ウィンドウ (コントロール類) の SHOW は大量に発火するのでここで落とす。
+        // 消滅系は破棄済み HWND に GetAncestor が効かないため絞らない
+        // (Core 側は未管理の HWND を即座に無視する)
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED if GetAncestor(hwnd, GA_ROOT) != hwnd => return,
         EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => WmEvent::Appeared(h),
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE => WmEvent::Gone(h),
         EVENT_OBJECT_CLOAKED => WmEvent::Cloaked(h),
         EVENT_SYSTEM_FOREGROUND => WmEvent::Foreground(h),
         EVENT_SYSTEM_MINIMIZESTART => WmEvent::MinimizeStart(h),
         EVENT_SYSTEM_MINIMIZEEND => WmEvent::MinimizeEnd(h),
+        EVENT_SYSTEM_MOVESIZEEND => WmEvent::MoveSizeEnd(h),
         _ => return,
     };
     // コールバック内は最小限の仕事に留める (受信側で inspect する)
