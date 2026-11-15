@@ -46,6 +46,52 @@ pub enum FocusDir {
     Down,
 }
 
+/// フローティング窓を方向キーで動かす 1 ステップぶんの移動。
+/// 作業領域の幅 (左右) / 高さ (上下) の 1/20 だけずらす。大きさは変えない。
+pub fn nudge_rect(r: Rect, dir: FocusDir, work: Rect) -> Rect {
+    let (dx, dy) = match dir {
+        FocusDir::Left => (-(work.w / 20), 0),
+        FocusDir::Right => (work.w / 20, 0),
+        FocusDir::Up => (0, -(work.h / 20)),
+        FocusDir::Down => (0, work.h / 20),
+    };
+    Rect {
+        x: r.x + dx,
+        y: r.y + dy,
+        ..r
+    }
+}
+
+/// フロート窓間のフォーカス移動先を選ぶ。中心点どうしを比べ、`dir` 側に
+/// (主軸で厳密に) あるものだけを候補とし、主軸距離 + 2 * 直交軸距離が最小のものを返す。
+/// 同点は先に並んでいるもの。該当がなければ None (ラップしない)。
+pub fn pick_in_direction(
+    from: Rect,
+    dir: FocusDir,
+    candidates: &[(WindowId, Rect)],
+) -> Option<WindowId> {
+    let (fx, fy) = (from.x + from.w / 2, from.y + from.h / 2);
+    let mut best: Option<(i64, WindowId)> = None;
+    for &(id, r) in candidates {
+        let dx = (r.x + r.w / 2 - fx) as i64;
+        let dy = (r.y + r.h / 2 - fy) as i64;
+        let (primary, ortho) = match dir {
+            FocusDir::Right => (dx, dy),
+            FocusDir::Left => (-dx, dy),
+            FocusDir::Down => (dy, dx),
+            FocusDir::Up => (-dy, dx),
+        };
+        if primary <= 0 {
+            continue;
+        }
+        let score = primary + 2 * ortho.abs();
+        if best.is_none_or(|(s, _)| score < s) {
+            best = Some((score, id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// モニタ 1 枚ぶんの無限ストリップとビューポート。
 #[derive(Debug, Clone, Default)]
 pub struct Strip {
@@ -493,6 +539,96 @@ pub fn scale_width(w: i32, from: i32, to: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_in_direction_chooses_nearest_aligned_on_the_dir_side() {
+        let rc = |x, y| Rect {
+            x,
+            y,
+            w: 100,
+            h: 100,
+        };
+        let from = rc(500, 500);
+        let right = (WindowId(1), rc(800, 500));
+        let left = (WindowId(2), rc(200, 500));
+        let down = (WindowId(3), rc(500, 800));
+        let up = (WindowId(4), rc(500, 200));
+        let all = [right, left, down, up];
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Right, &all),
+            Some(WindowId(1))
+        );
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Left, &all),
+            Some(WindowId(2))
+        );
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Down, &all),
+            Some(WindowId(3))
+        );
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Up, &all),
+            Some(WindowId(4))
+        );
+        // 手前でも斜めにずれたものより、遠くても正面のものを選ぶ
+        let diag = (WindowId(5), rc(650, 800));
+        let aligned = (WindowId(6), rc(500, 1000));
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Down, &[diag, aligned]),
+            Some(WindowId(6))
+        );
+        // 逆側・同じ中心しかなければ None
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Right, &[left, down]),
+            None
+        );
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Right, &[(WindowId(7), from)]),
+            None
+        );
+        assert_eq!(pick_in_direction(from, FocusDir::Up, &[]), None);
+        // 同点は先頭
+        let a = (WindowId(8), rc(800, 400));
+        let b = (WindowId(9), rc(800, 600));
+        assert_eq!(
+            pick_in_direction(from, FocusDir::Right, &[a, b]),
+            Some(WindowId(8))
+        );
+    }
+
+    #[test]
+    fn nudge_moves_by_a_twentieth_of_work_area_and_keeps_size() {
+        let work = Rect {
+            x: 0,
+            y: 0,
+            w: 2000,
+            h: 1000,
+        };
+        let r = Rect {
+            x: 500,
+            y: 300,
+            w: 400,
+            h: 300,
+        };
+        let moved = |d| nudge_rect(r, d, work);
+        assert_eq!(
+            (moved(FocusDir::Left).x, moved(FocusDir::Left).y),
+            (400, 300)
+        );
+        assert_eq!(
+            (moved(FocusDir::Right).x, moved(FocusDir::Right).y),
+            (600, 300)
+        );
+        assert_eq!((moved(FocusDir::Up).x, moved(FocusDir::Up).y), (500, 250));
+        assert_eq!(
+            (moved(FocusDir::Down).x, moved(FocusDir::Down).y),
+            (500, 350)
+        );
+        assert_eq!(
+            (moved(FocusDir::Down).w, moved(FocusDir::Down).h),
+            (400, 300)
+        );
+    }
 
     #[test]
     fn rescale_keeps_width_ratio_and_follows_maximize() {

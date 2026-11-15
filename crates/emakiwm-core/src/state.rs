@@ -88,6 +88,10 @@ pub struct State {
     /// フォーカス中の管理ウィンドウ。管理外の窓が前面でも直前の値を保つ
     pub focused: Option<WindowId>,
     pub fullscreen: Option<WindowId>,
+    /// toggle-floating でレイアウトから外したウィンドウ (末尾ほど新しい)
+    pub floating: Vec<WindowId>,
+    /// WM が動かしてはいないが浮いているとわかっている窓 (ダイアログ・ルールの float 等)
+    pub passive_floats: Vec<WindowId>,
     gap: i32,
     default_ratio: f32,
     /// 直前のモニター跨ぎフォーカス追従の記録 (前フォーカス窓, 時刻)。
@@ -100,6 +104,10 @@ pub struct State {
     /// Z 順フォールバック前面化が届くことがある。防衛時間内の別モニターへの
     /// 前面化は stale とみなして無視し、後継を再主張する
     focus_guard: Option<(WindowId, u64)>,
+    /// 最後に前面だった管理外のフロート窓 (focus-floating の戻り先)
+    float_focus: Option<WindowId>,
+    /// 現在キーボードフォーカスを持つ toggle-floating 済みの窓
+    float_active: Option<WindowId>,
 }
 
 impl State {
@@ -116,6 +124,10 @@ impl State {
             active_monitor: 0,
             focused: None,
             fullscreen: None,
+            floating: Vec::new(),
+            passive_floats: Vec::new(),
+            float_focus: None,
+            float_active: None,
             gap,
             default_ratio,
             cross_follow: None,
@@ -287,6 +299,120 @@ impl State {
         strip.last_focused = Some(id);
         strip.ensure_visible(id, vw);
         None
+    }
+
+    /// toggle-floating でフロート化されているか。
+    pub fn is_floating(&self, id: WindowId) -> bool {
+        self.floating.contains(&id)
+    }
+
+    /// タイルをフロート化する (レイアウトから外して記録する)。
+    /// タイル側の `focused` は後継へ移るが、フロート化した窓が前面のままなので
+    /// 前面化は要求しない。戻り値: フロート化したか (未管理なら false)。
+    pub fn float(&mut self, id: WindowId, now: u64) -> bool {
+        if self.remove(id, now).is_none() {
+            return false;
+        }
+        // remove の後継防衛は「閉じた直後」用。フロート化では窓が残るので不要
+        self.focus_guard = None;
+        self.floating.push(id);
+        self.float_focus = Some(id);
+        // フロート化した窓は前面のまま
+        self.float_active = Some(id);
+        true
+    }
+
+    /// WM が浮かせたわけではないフロート窓 (ダイアログ・ルールの float 等) を記録する。
+    /// タイル・フロート化済み・記録済みなら何もしない。
+    pub fn add_passive_float(&mut self, id: WindowId) {
+        if self.monitor_index_of(id).is_some()
+            || self.floating.contains(&id)
+            || self.passive_floats.contains(&id)
+        {
+            return;
+        }
+        self.passive_floats.push(id);
+    }
+
+    /// toggle-floating 済み、または受動的なフロート窓か。
+    pub fn is_float(&self, id: WindowId) -> bool {
+        self.floating.contains(&id) || self.passive_floats.contains(&id)
+    }
+
+    /// 全フロート窓 (toggle-floating 済み → 受動の順)。
+    pub fn floats(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.floating
+            .iter()
+            .chain(self.passive_floats.iter())
+            .copied()
+    }
+
+    /// 前面窓がフロート窓かをシェルから受け取る。
+    /// 前面窓がフロート窓なら Some(id)、それ以外 (タイル・管理外) なら None。
+    pub fn set_float_foreground(&mut self, id: Option<WindowId>) {
+        self.float_active = id;
+    }
+
+    /// 「フォーカスされた見た目」にすべき窓。フロート窓が前面ならそれ、なければタイルの focused。
+    pub fn highlighted(&self) -> Option<WindowId> {
+        self.float_active.or(self.focused)
+    }
+
+    /// フロート窓をタイルへ戻す。記録のない管理外ウィンドウの取り込みにも使う。
+    /// 戻り値は前面化すべきウィンドウ (既に管理中なら None)。
+    pub fn unfloat(&mut self, id: WindowId) -> Option<WindowId> {
+        self.forget_floating(id);
+        if self.monitor_index_of(id).is_some() {
+            return None;
+        }
+        self.adopt(id)
+    }
+
+    /// フロート窓の記録を消す (ウィンドウの破棄時)。
+    pub fn forget_floating(&mut self, id: WindowId) {
+        self.floating.retain(|f| *f != id);
+        self.passive_floats.retain(|f| *f != id);
+        if self.float_focus == Some(id) {
+            self.float_focus = None;
+        }
+        if self.float_active == Some(id) {
+            self.float_active = None;
+        }
+    }
+
+    /// 管理外のフロート窓 (ダイアログ等を含む) が前面になったことを記録する。
+    pub fn note_float_focus(&mut self, id: WindowId) {
+        self.float_focus = Some(id);
+        if let Some(i) = self.floating.iter().position(|f| *f == id) {
+            let f = self.floating.remove(i);
+            self.floating.push(f);
+        }
+        if let Some(i) = self.passive_floats.iter().position(|f| *f == id) {
+            let f = self.passive_floats.remove(i);
+            self.passive_floats.push(f);
+        }
+    }
+
+    /// focus-floating の切替先候補を優先順に返す。`on_tile`: 現在の前面がタイルか。
+    /// タイルからは最後に前面だったフロート窓、次に toggle-floating 済みの窓 (新しい順)、
+    /// 最後に受動フロート窓 (新しい順)。それ以外からはタイル側のフォーカスへ。
+    /// 生存確認は呼び出し側で行う。
+    pub fn focus_toggle_candidates(&self, on_tile: bool) -> Vec<WindowId> {
+        if !on_tile {
+            return self.focused.into_iter().collect();
+        }
+        let mut out: Vec<WindowId> = self.float_focus.into_iter().collect();
+        for &f in self
+            .floating
+            .iter()
+            .rev()
+            .chain(self.passive_floats.iter().rev())
+        {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+        out
     }
 
     /// フォーカス移動 (FR-4.1)。上下の端ではワークスペース切替へ続く。
@@ -886,6 +1012,124 @@ mod tests {
         assert_eq!(cols[1].x, width + 50 + GAP);
         // 2 回目は安定 (読み戻しがループしない)
         assert!(!s.grow_column(w(1), width + 50));
+    }
+
+    #[test]
+    fn float_removes_from_layout_and_keeps_tile_focus_on_successor() {
+        let mut s = two_monitors();
+        assert!(s.float(w(2), 0));
+        assert!(s.is_floating(w(2)));
+        assert_eq!(s.monitor_index_of(w(2)), None);
+        // タイル側のフォーカスは後継へ。フロート窓から戻る先になる
+        assert_eq!(s.focused, Some(w(1)));
+        assert_eq!(s.focus_toggle_candidates(false), [w(1)]);
+        assert_eq!(s.focus_toggle_candidates(true), [w(2)]);
+        // フロート化直後に別モニターの窓を前面化しても stale 扱いしない
+        assert_eq!(s.foreground(w(3), false, 10), None);
+        assert_eq!(s.focused, Some(w(3)));
+        assert!(!s.float(w(99), 0));
+    }
+
+    #[test]
+    fn unfloat_returns_window_to_layout_next_to_focus() {
+        let mut s = two_monitors();
+        s.float(w(1), 0);
+        assert_eq!(s.unfloat(w(1)), Some(w(1)));
+        assert!(!s.is_floating(w(1)));
+        let cols: Vec<_> = s.monitors[0].stack.strips[0]
+            .columns
+            .iter()
+            .map(|c| c.tiles[0])
+            .collect();
+        assert_eq!(cols, [w(2), w(1)]);
+        assert_eq!(s.focused, Some(w(1)));
+        // 既にタイルなら何もしない
+        assert_eq!(s.unfloat(w(1)), None);
+    }
+
+    #[test]
+    fn highlighted_follows_float_foreground_else_tile_focus() {
+        let mut s = two_monitors();
+        assert_eq!(s.highlighted(), Some(w(2)));
+        // フロート化した窓は前面のまま強調される。タイル側の focused は後継へ
+        s.float(w(2), 0);
+        assert_eq!(s.highlighted(), Some(w(2)));
+        assert_eq!(s.focused, Some(w(1)));
+        // タイルが前面になれば focused へ戻る
+        s.set_float_foreground(None);
+        assert_eq!(s.highlighted(), Some(w(1)));
+        s.set_float_foreground(Some(w(2)));
+        assert_eq!(s.highlighted(), Some(w(2)));
+        // unfloat / 破棄で強調を手放す
+        s.unfloat(w(2));
+        assert_eq!(s.highlighted(), s.focused);
+        s.float(w(1), 0);
+        s.forget_floating(w(1));
+        assert_eq!(s.highlighted(), s.focused);
+    }
+
+    #[test]
+    fn passive_float_is_tracked_and_highlighted_without_being_user_floated() {
+        let mut s = two_monitors();
+        s.add_passive_float(w(50));
+        // 二重登録・タイル・フロート化済みは無視
+        s.add_passive_float(w(50));
+        s.add_passive_float(w(1));
+        s.float(w(2), 0);
+        s.add_passive_float(w(2));
+        assert_eq!(s.passive_floats, [w(50)]);
+        assert!(s.is_float(w(50)) && s.is_float(w(2)) && !s.is_float(w(1)));
+        // toggle-floating 済みを示す is_floating は受動を含まない
+        assert!(!s.is_floating(w(50)));
+        assert_eq!(s.floats().collect::<Vec<_>>(), [w(2), w(50)]);
+        s.set_float_foreground(Some(w(50)));
+        assert_eq!(s.highlighted(), Some(w(50)));
+        // 破棄・タイル化で受動の記録も消える
+        assert_eq!(s.unfloat(w(50)), Some(w(50)));
+        assert!(!s.is_float(w(50)));
+        assert_eq!(s.highlighted(), s.focused);
+        s.add_passive_float(w(60));
+        s.forget_floating(w(60));
+        assert!(!s.is_float(w(60)));
+    }
+
+    #[test]
+    fn focus_toggle_includes_passive_floats_after_user_floats() {
+        let mut s = two_monitors();
+        s.float(w(1), 0);
+        s.add_passive_float(w(50));
+        s.add_passive_float(w(51));
+        // 最後に前面だった窓 → フロート化済み (新しい順) → 受動 (新しい順)
+        s.note_float_focus(w(50));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50), w(1), w(51)]);
+        // 受動窓も前面になるたびに MRU の先頭へ
+        s.note_float_focus(w(51));
+        s.note_float_focus(w(50));
+        assert_eq!(s.passive_floats, [w(51), w(50)]);
+        s.note_float_focus(w(1));
+        assert_eq!(s.focus_toggle_candidates(true), [w(1), w(50), w(51)]);
+        // 前面記録がなくても受動窓へ戻れる
+        let mut s = two_monitors();
+        s.add_passive_float(w(50));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50)]);
+    }
+
+    #[test]
+    fn focus_toggle_prefers_last_focused_float() {
+        let mut s = two_monitors();
+        s.float(w(1), 0);
+        s.float(w(2), 0);
+        assert_eq!(s.focus_toggle_candidates(true), [w(2), w(1)]);
+        s.note_float_focus(w(1));
+        assert_eq!(s.focus_toggle_candidates(true), [w(1), w(2)]);
+        // フロート化していない管理外の窓 (ダイアログ等) も戻り先になる
+        s.note_float_focus(w(50));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50), w(1), w(2)]);
+        s.forget_floating(w(1));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50), w(2)]);
+        // タイルが 1 つもなければ戻り先なし
+        s.remove(w(3), 0);
+        assert_eq!(s.focus_toggle_candidates(false), []);
     }
 
     #[test]

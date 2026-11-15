@@ -22,10 +22,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, PostThreadMessageW, RegisterClassW, SetWindowsHookExW, EVENT_OBJECT_CLOAKED,
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, GA_ROOT, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
-    WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE,
-    WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
+    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, KBDLLHOOKSTRUCT, MSG,
+    MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
+    WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
 };
 
 use crate::touchpad::GestureBinds;
@@ -43,6 +43,9 @@ pub enum WmEvent {
     Foreground(isize),
     MinimizeStart(isize),
     MinimizeEnd(isize),
+    /// ユーザーによる手動移動・リサイズの開始 (MOVESIZESTART)。
+    /// フロート窓のドラッグ中は太枠オーバーレイを隠すために使う
+    MoveSizeStart(isize),
     /// ユーザーによる手動移動・リサイズの完了 (MOVESIZEEND)
     MoveSizeEnd(isize),
     /// Alt+H/L/J/K (FR-4.1)
@@ -72,6 +75,10 @@ pub enum WmEvent {
     /// フォーカスウィンドウの opacity ピンのトグル (FR-3.8)。
     /// ピン中は非フォーカスでも pinned_opacity を維持する
     ToggleOpacity,
+    /// 前面ウィンドウのフローティング ⇔ タイルの切替
+    ToggleFloating,
+    /// フローティングウィンドウとタイルの間でフォーカスを切替
+    FocusFloating,
     /// 隣のモニタへフォーカスを移動する。true = 右/次
     FocusMonitor(bool),
     /// フォーカスウィンドウを隣のモニタへ移動する。true = 右/次
@@ -131,6 +138,8 @@ pub fn parse_command(s: &str) -> Option<WmEvent> {
         ("fullscreen", "") => WmEvent::Fullscreen,
         ("close", "") => WmEvent::CloseFocused,
         ("toggle-opacity", "") => WmEvent::ToggleOpacity,
+        ("toggle-floating", "") => WmEvent::ToggleFloating,
+        ("focus-floating", "") => WmEvent::FocusFloating,
         ("focus-monitor", "right") => WmEvent::FocusMonitor(true),
         ("focus-monitor", "left") => WmEvent::FocusMonitor(false),
         ("move-to-monitor", "right") => WmEvent::MoveToMonitor(true),
@@ -277,7 +286,7 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, binds: InputBinds) {
         HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
 
         // 必要レンジのみフックする (全イベント購読は高コスト):
-        //   0x0003..0x0017: FOREGROUND / MOVESIZEEND / MINIMIZESTART / MINIMIZEEND
+        //   0x0003..0x0017: FOREGROUND / MOVESIZESTART / MOVESIZEEND / MINIMIZESTART / MINIMIZEEND
         //   0x8001..0x8003: DESTROY / SHOW / HIDE
         //   0x8017..0x8018: CLOAKED / UNCLOAKED
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
@@ -411,6 +420,7 @@ unsafe extern "system" fn win_event_proc(
         EVENT_SYSTEM_FOREGROUND => WmEvent::Foreground(h),
         EVENT_SYSTEM_MINIMIZESTART => WmEvent::MinimizeStart(h),
         EVENT_SYSTEM_MINIMIZEEND => WmEvent::MinimizeEnd(h),
+        EVENT_SYSTEM_MOVESIZESTART => WmEvent::MoveSizeStart(h),
         EVENT_SYSTEM_MOVESIZEEND => WmEvent::MoveSizeEnd(h),
         _ => return,
     };

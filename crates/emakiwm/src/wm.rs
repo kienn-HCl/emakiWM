@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use emakiwm_core::anim::{ease_out_cubic, lerp_rect};
 use emakiwm_core::filter::Decision;
-use emakiwm_core::layout::{Rect, WindowId};
+use emakiwm_core::layout::{nudge_rect, pick_in_direction, FocusDir, Rect, WindowId};
 use emakiwm_core::state::{Monitor, MonitorGeom, State};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{
@@ -47,9 +47,10 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetForegroundWindow,
     GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsZoomed, PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_SHOWDEFAULT, WM_CLOSE, WS_EX_LAYERED,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST,
+    HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWDEFAULT,
+    WM_CLOSE, WS_EX_LAYERED, WS_EX_TOPMOST,
 };
 
 use crate::events::{self, WmEvent};
@@ -104,6 +105,11 @@ enum Hide {
 /// FR-3.8 半透明化のために WS_EX_LAYERED を付与したウィンドウと現在のアルファ。
 /// 終了時に必ず不透明へ戻す。
 static DIMMED: Mutex<Vec<(u64, u8)>> = Mutex::new(Vec::new());
+
+/// toggle-floating でフロート化した全ウィンドウと、WM が最前面 (TOPMOST) を付けたか。
+/// タイルへ戻すとき・終了時に最前面指定を外し (WM が付けたものだけ)、枠色を戻す。
+/// フロート窓は RESTORE_RECTS から外れるため、終了時の後始末はこの記録で行う。
+static FLOATS: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
 
 /// 1 ウィンドウぶんの補間区間。
 struct AnimEntry {
@@ -173,6 +179,8 @@ pub fn run() {
     let mut subscribers: Vec<mpsc::Sender<String>> = Vec::new();
     let mut last_state = String::new();
     let mut bordered: Option<u64> = None;
+    // マウスで移動・リサイズ中のフロート窓 (太枠オーバーレイが遅れるので隠す)
+    let mut dragging: Option<u64> = None;
     let mut pinned: Vec<u64> = Vec::new();
     // FR-3.6 の実サイズ読み戻し: 現在のレイアウト変化について残り何回確認するかと、
     // 次に確認する時刻 (None = 予定なし)
@@ -184,12 +192,14 @@ pub fn run() {
     let mut reapplied: HashSet<u64> = HashSet::new();
 
     // FR-1.1: 起動時スキャン。モニターごとに左端 x 順に並べてタイル化する
-    let all_initial: Vec<scan::ScanEntry> = {
-        let mut v: Vec<scan::ScanEntry> = scan::scan(&cfg.rules)
-            .into_iter()
-            .filter(|e| e.decision == Decision::Manage && e.elevated != Some(true))
-            .filter(|e| unsafe { !IsIconic(HWND(e.hwnd as _)).as_bool() })
-            .collect();
+    let (all_initial, initial_others): (Vec<scan::ScanEntry>, Vec<scan::ScanEntry>) =
+        scan::scan(&cfg.rules).into_iter().partition(|e| {
+            e.decision == Decision::Manage
+                && e.elevated != Some(true)
+                && unsafe { !IsIconic(HWND(e.hwnd as _)).as_bool() }
+        });
+    let all_initial = {
+        let mut v = all_initial;
         // (monitor_index, rect.left) でソートして各モニター内の左→右順を保つ
         v.sort_by_key(|e| (monitor_for_window(e.hwnd, &state.monitors), e.rect.left));
         v
@@ -210,6 +220,8 @@ pub fn run() {
         }
     }
 
+    // 起動時点で既にあるダイアログ・ルールの float 窓も装飾対象にする
+    sync_passive_floats(&mut state, &cfg, &initial_others);
     persist_restore_rects();
 
     for cmd in &cfg.startup {
@@ -270,19 +282,29 @@ pub fn run() {
                     // どこかの Stack が既に管理中なら何もしない。物理位置ベースで
                     // adopt すると、退避・アニメ中に他モニター上で UNCLOAKED/SHOW が
                     // 発火したとき別モニターの Stack へ二重登録されてしまう
-                    if state.monitor_index_of(id).is_some() {
+                    if state.monitor_index_of(id).is_some() || state.is_floating(id) {
                         None
-                    } else if let Some(e) = inspect_manageable(h, &cfg.rules) {
-                        let work = state.monitors[state.active_monitor].work;
-                        register_window(&mut visual, &mut borders, &e, work);
-                        let focus = state.adopt(id);
-                        persist_restore_rects();
-                        if let Some(c) = border_colors(&cfg) {
-                            set_border_color(h as u64, c.1);
-                        }
-                        focus
                     } else {
-                        None
+                        let (e, manageable) = inspect_manageable(h, &cfg.rules);
+                        match manageable {
+                            true => {
+                                let work = state.monitors[state.active_monitor].work;
+                                register_window(&mut visual, &mut borders, &e, work);
+                                let focus = state.adopt(id);
+                                persist_restore_rects();
+                                if let Some(c) = border_colors(&cfg) {
+                                    set_border_color(h as u64, c.1);
+                                }
+                                focus
+                            }
+                            false => {
+                                // タイルにしない窓がダイアログ等のフロートなら装飾対象にする
+                                if register_passive_float(&mut state, &cfg, &e) {
+                                    persist_restore_rects();
+                                }
+                                None
+                            }
+                        }
                     }
                 }
                 WmEvent::Cloaked(h) if cloaked_by_us(h as u64) || !window_cloaked(h) => None,
@@ -307,10 +329,54 @@ pub fn run() {
                             persist_restore_rects();
                             removal.focus
                         }
-                        None => None,
+                        None => {
+                            // フロート化した窓が破棄されたら記録を消す (最小化では消さない)
+                            let id = WindowId(h as u64);
+                            if state.is_floating(id)
+                                && !unsafe { IsWindow(Some(HWND(h as _))).as_bool() }
+                            {
+                                state.forget_floating(id);
+                                forget_float_record(h as u64);
+                                undim_window(h as u64);
+                                if dragging == Some(h as u64) {
+                                    dragging = None;
+                                }
+                                persist_restore_rects();
+                            } else if state.passive_floats.contains(&id) {
+                                // 受動フロート窓は破棄・非表示・最小化・別デスクトップ行きの
+                                // いずれでも登録を外す (再表示されれば Appeared で再登録)
+                                unregister_passive_float(&mut state, h as u64);
+                                if dragging == Some(h as u64) {
+                                    dragging = None;
+                                }
+                                persist_restore_rects();
+                            }
+                            None
+                        }
                     }
                 }
                 WmEvent::Foreground(h) => {
+                    let id = WindowId(h as u64);
+                    // WM が付けた最前面指定をアプリが落としていたら付け直す
+                    reassert_float_topmost();
+                    // 管理外のフロート窓 (ダイアログ・ルールや手動でフロートにした窓) が
+                    // 前面になったら、focus-floating の戻り先として覚える
+                    if state.monitor_index_of(id).is_none() {
+                        if state.is_float(id) {
+                            state.note_float_focus(id);
+                        } else if !HWND(h as _).is_invalid() {
+                            // 同じ窓を二重に inspect しないよう 1 回の結果を共用する
+                            let e = scan::inspect(HWND(h as _), &cfg.rules);
+                            if tileable_ok(&e) {
+                                state.note_float_focus(id);
+                            }
+                            if register_passive_float(&mut state, &cfg, &e) {
+                                persist_restore_rects();
+                            }
+                        }
+                    }
+                    // フロート窓が前面なら、そちらを「フォーカスされた見た目」にする
+                    state.set_float_foreground(state.is_float(id).then_some(id));
                     let focused_dead = state.focused.is_some_and(|f| unsafe {
                         let hw = HWND(f.0 as _);
                         !IsWindow(Some(hw)).as_bool() || IsIconic(hw).as_bool()
@@ -324,9 +390,29 @@ pub fn run() {
                     }
                     reassert
                 }
-                WmEvent::Focus(dir) => state.focus(dir),
+                WmEvent::Focus(dir) => {
+                    // フロート窓が前面のとき: 左右は方向にいちばん近いフロート窓へ
+                    // フォーカスする (なければ何もしない)。上下はワークスペースを切り替え、
+                    // フォーカスはフロート窓に残す (フロート窓を手前に置いたまま下の
+                    // タイルを入れ替えられる)
+                    let fg = unsafe { GetForegroundWindow() };
+                    if !state.is_float(WindowId(fg.0 as u64)) {
+                        state.focus(dir)
+                    } else if matches!(dir, FocusDir::Left | FocusDir::Right) {
+                        focus_float_in_direction(fg, dir, &state)
+                    } else {
+                        state.switch_workspace(dir == FocusDir::Down);
+                        None
+                    }
+                }
                 WmEvent::MoveColumn(dir) => {
-                    state.move_column(dir);
+                    // フロート窓が前面なら、レイアウトではなくその窓を左右へ動かす
+                    let fg = unsafe { GetForegroundWindow() };
+                    if state.is_float(WindowId(fg.0 as u64)) {
+                        nudge_float(fg, dir, &state);
+                    } else {
+                        state.move_column(dir);
+                    }
                     None
                 }
                 WmEvent::Expel => {
@@ -338,7 +424,14 @@ pub fn run() {
                     None
                 }
                 WmEvent::MoveToWorkspace(down) => {
-                    state.move_to_workspace(down);
+                    // フロート窓が前面なら、ワークスペース移動ではなくその窓を上下へ動かす
+                    let fg = unsafe { GetForegroundWindow() };
+                    if state.is_float(WindowId(fg.0 as u64)) {
+                        let dir = if down { FocusDir::Down } else { FocusDir::Up };
+                        nudge_float(fg, dir, &state);
+                    } else {
+                        state.move_to_workspace(down);
+                    }
                     None
                 }
                 WmEvent::SwitchWorkspace(down) => state.switch_workspace(down),
@@ -360,8 +453,17 @@ pub fn run() {
                 }
                 // ユーザーによる手動移動・リサイズの完了 (FR-1.2)。リサイズ後の幅は
                 // Column 幅として採用し、位置はタイルの定位置へ戻す
+                WmEvent::MoveSizeStart(h) => {
+                    if state.is_float(WindowId(h as u64)) {
+                        dragging = Some(h as u64);
+                    }
+                    None
+                }
                 WmEvent::MoveSizeEnd(h) => {
                     let id = WindowId(h as u64);
+                    if dragging == Some(h as u64) {
+                        dragging = None;
+                    }
                     if state.monitor_index_of(id).is_some() {
                         if let Some(actual) = frame_rect(h) {
                             let target_w = last_targets
@@ -394,6 +496,59 @@ pub fn run() {
                     shell_spawn(&cmd);
                     None
                 }
+                // フローティングの切替: 前面がタイルならレイアウトから外し、
+                // 管理外のウィンドウならタイルとして取り込む
+                WmEvent::ToggleFloating => {
+                    let fg = unsafe { GetForegroundWindow() };
+                    let h = fg.0 as isize;
+                    let id = WindowId(h as u64);
+                    if let Some(mi) = state.monitor_index_of(id) {
+                        let work = state.monitors[mi].work;
+                        state.float(id, now_ms());
+                        visual.remove(&(h as u64));
+                        borders.remove(&(h as u64));
+                        cloak_set(h as u64, Hide::Show);
+                        undim_window(h as u64);
+                        pinned.retain(|&x| x != h as u64);
+                        min_widths.remove(&(h as u64));
+                        float_window(h, work);
+                        persist_restore_rects();
+                        tracing::info!("float {h:#x}");
+                        None
+                    } else if let Some(e) = inspect_tileable(h) {
+                        tracing::info!("tile {h:#x} \"{}\"", e.info.title);
+                        unfloat_window(h);
+                        let work = state.monitors[state.active_monitor].work;
+                        register_window(&mut visual, &mut borders, &e, work);
+                        let focus = state.unfloat(id);
+                        persist_restore_rects();
+                        if let Some(c) = border_colors(&cfg) {
+                            set_border_color(h as u64, c.1);
+                        }
+                        // 枠色の追従に再評価させる (フォーカス中なら下で focused 色になる)
+                        if bordered == Some(h as u64) {
+                            bordered = None;
+                        }
+                        if dragging == Some(h as u64) {
+                            dragging = None;
+                        }
+                        focus
+                    } else {
+                        None
+                    }
+                }
+                // フローティングとタイルの間でフォーカスを行き来する
+                WmEvent::FocusFloating => {
+                    let fg = WindowId(unsafe { GetForegroundWindow() }.0 as u64);
+                    let on_tile = state.monitor_index_of(fg).is_some();
+                    state
+                        .focus_toggle_candidates(on_tile)
+                        .into_iter()
+                        .find(|c| unsafe {
+                            let hw = HWND(c.0 as _);
+                            IsWindowVisible(hw).as_bool() && !IsIconic(hw).as_bool()
+                        })
+                }
                 WmEvent::ToggleOpacity => {
                     if let Some(f) = state.focused {
                         if let Some(i) = pinned.iter().position(|&x| x == f.0) {
@@ -418,6 +573,14 @@ pub fn run() {
                     let unfocused = border_colors(&cfg).map_or(BORDER_DEFAULT, |c| c.1);
                     for h in own_monitor_map(&state.monitors).into_keys() {
                         set_border_color(h, unfocused);
+                    }
+                    for f in state.floats() {
+                        set_border_color(f.0, unfocused);
+                    }
+                    // ルールが変わり得るので受動フロート窓を再評価する
+                    // (外れた窓は装飾を戻し、新たに該当する窓を登録)
+                    if sync_passive_floats(&mut state, &cfg, &scan::scan(&cfg.rules)) {
+                        persist_restore_rects();
                     }
                     bordered = None;
                     tracing::info!(
@@ -477,7 +640,7 @@ pub fn run() {
             }
 
             if let Some((focused_color, unfocused_color)) = border_colors(&cfg) {
-                let cur = state.focused.map(|f| f.0);
+                let cur = state.highlighted().map(|f| f.0);
                 if cur != bordered {
                     if let Some(prev) = bordered {
                         set_border_color(prev, unfocused_color);
@@ -593,7 +756,7 @@ pub fn run() {
 
         // FR-3.8: 非フォーカスウィンドウの半透明化
         if cfg.unfocused_alpha.is_some() || !pinned.is_empty() {
-            let f = state.focused.map(|f| f.0);
+            let f = state.highlighted().map(|f| f.0);
             for &(h, _) in &last_targets {
                 let alpha = if pinned.contains(&h) {
                     cfg.pinned_alpha
@@ -606,6 +769,17 @@ pub fn run() {
                     undim_window(h);
                 } else {
                     dim_window(h, alpha);
+                }
+            }
+            // フロート窓もタイルと同じく、フォーカス外なら半透明にする
+            for fl in state.floats() {
+                if f == Some(fl.0) {
+                    undim_window(fl.0);
+                } else {
+                    match cfg.unfocused_alpha {
+                        Some(a) if a != 255 => dim_window(fl.0, a),
+                        _ => undim_window(fl.0),
+                    }
                 }
             }
         }
@@ -629,7 +803,35 @@ pub fn run() {
                 if !visible {
                     continue;
                 }
-                let color = if state.focused.map(|f| f.0) == Some(h) {
+                let color = if state.highlighted().map(|f| f.0) == Some(h) {
+                    fc
+                } else {
+                    uc
+                };
+                if color >= 0xFFFF_FFFE {
+                    continue;
+                }
+                items.push(border::Item {
+                    owner: h,
+                    rect: r,
+                    color,
+                });
+            }
+            // フロート窓: 自由に動くので毎回実際のフレームを問い合わせる。
+            // ドラッグ中は枠が遅れるため出さない (MOVESIZEEND で復帰)
+            for fl in state.floats() {
+                let h = fl.0;
+                if dragging == Some(h) {
+                    continue;
+                }
+                let hwnd = HWND(h as _);
+                if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+                    continue;
+                }
+                let Some(r) = frame_rect(h as isize) else {
+                    continue;
+                };
+                let color = if state.highlighted() == Some(fl) {
                     fc
                 } else {
                     uc
@@ -790,14 +992,15 @@ fn targets(state: &State) -> Vec<(u64, Rect)> {
         .collect()
 }
 
-/// 新規ウィンドウが管理対象かを判定する (FR-1.3)。対象ならスキャン結果を返す。
-fn inspect_manageable(h: isize, rules: &[emakiwm_core::filter::Rule]) -> Option<scan::ScanEntry> {
+/// 新規ウィンドウが管理対象かを判定する (FR-1.3)。対象なら true。
+/// 受動フロート判定に再利用できるよう、スキャン結果も一緒に返す。
+fn inspect_manageable(h: isize, rules: &[emakiwm_core::filter::Rule]) -> (scan::ScanEntry, bool) {
     let e = scan::inspect(HWND(h as _), rules);
     if e.decision != Decision::Manage || e.elevated == Some(true) {
-        return None;
+        return (e, false);
     }
     if unsafe { IsIconic(HWND(h as _)).as_bool() } {
-        return None;
+        return (e, false);
     }
     tracing::info!(
         "adopt {:#x} {} \"{}\"",
@@ -805,7 +1008,129 @@ fn inspect_manageable(h: isize, rules: &[emakiwm_core::filter::Rule]) -> Option<
         e.info.exe_name.as_deref().unwrap_or("?"),
         e.info.title
     );
-    Some(e)
+    (e, true)
+}
+
+/// 受動的フロート窓 (ダイアログ・ルールの float 等、WM が浮かせたわけではない窓) として
+/// 装飾・キー移動の対象にするか。ルール判定が Float で、可視・自プロセス外・
+/// キャプション付き・ツールウィンドウでなく、最小化されていないもの。
+fn passive_float_candidate(e: &scan::ScanEntry) -> bool {
+    let caption = emakiwm_core::filter::WS_CAPTION;
+    matches!(e.decision, Decision::Float(_))
+        && e.info.is_visible
+        && !e.info.is_own_process
+        && e.info.style & caption == caption
+        && e.info.ex_style & emakiwm_core::filter::WS_EX_TOOLWINDOW == 0
+        && e.elevated != Some(true)
+        && unsafe { !IsIconic(HWND(e.hwnd as _)).as_bool() }
+}
+
+/// 受動的フロート窓として未登録なら登録する (枠色・終了時の後始末の記録を含む)。
+/// 位置・Z オーダーには触らない。登録したら true。
+fn register_passive_float(state: &mut State, cfg: &config::Config, e: &scan::ScanEntry) -> bool {
+    let id = WindowId(e.hwnd as u64);
+    if state.is_float(id) || state.monitor_index_of(id).is_some() || !passive_float_candidate(e) {
+        return false;
+    }
+    state.add_passive_float(id);
+    // タイルの下へ沈まないよう最前面にする。位置・大きさは変えない。
+    // 元から最前面だった窓は、終了時に外さないよう「WM が付けた」記録にしない
+    let hwnd = HWND(e.hwnd as _);
+    let we_set_topmost =
+        unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_TOPMOST.0 as isize == 0;
+    if we_set_topmost {
+        set_topmost(e.hwnd as u64);
+    }
+    record_float(e.hwnd as u64, we_set_topmost);
+    if let Some(c) = border_colors(cfg) {
+        set_border_color(e.hwnd as u64, c.1);
+    }
+    // 開いた直後の窓は FOREGROUND イベントが可視化前に届き、フロートとして
+    // 認識できないまま取り逃がす。登録時点で前面ならここでフォーカス扱いにする
+    if unsafe { GetForegroundWindow() } == hwnd {
+        state.note_float_focus(id);
+        state.set_float_foreground(Some(id));
+    }
+    tracing::info!(
+        "passive float {:#x} {} \"{}\"",
+        e.hwnd,
+        e.info.exe_name.as_deref().unwrap_or("?"),
+        e.info.title
+    );
+    true
+}
+
+/// 受動的フロート窓の登録を外し、装飾 (半透明・枠色) と後始末の記録を戻す。
+fn unregister_passive_float(state: &mut State, h: u64) {
+    state.forget_floating(WindowId(h));
+    undim_window(h);
+    set_border_color(h, BORDER_DEFAULT);
+    // 記録を消し、WM が付けた最前面指定を外す
+    unfloat_window(h as isize);
+}
+
+/// 受動的フロート窓の集合をスキャン結果へ合わせる (起動時・設定の再読み込み時)。
+/// もう該当しない窓は登録を外し、新たに該当する窓を登録する。変化があれば true。
+fn sync_passive_floats(
+    state: &mut State,
+    cfg: &config::Config,
+    scanned: &[scan::ScanEntry],
+) -> bool {
+    let mut changed = false;
+    for id in state.passive_floats.clone() {
+        let still = scanned
+            .iter()
+            .any(|e| e.hwnd as u64 == id.0 && passive_float_candidate(e));
+        if !still {
+            unregister_passive_float(state, id.0);
+            changed = true;
+        }
+    }
+    for e in scanned {
+        changed |= register_passive_float(state, cfg, e);
+    }
+    changed
+}
+
+/// フロート窓の記録 (終了時の後始末用)。記録済みなら何もしない。
+fn record_float(h: u64, topmost: bool) {
+    let mut floats = FLOATS.lock().unwrap_or_else(|p| p.into_inner());
+    if !floats.iter().any(|&(x, _)| x == h) {
+        floats.push((h, topmost));
+    }
+}
+
+/// WM が最前面にしたフロート窓から TOPMOST が外れていたら付け直す。
+/// アプリが自分で最前面指定を落とすことがあるため、前面窓が変わるたびに確認する。
+fn reassert_float_topmost() {
+    let hs: Vec<u64> = FLOATS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|&&(_, topmost)| topmost)
+        .map(|&(h, _)| h)
+        .collect();
+    for h in hs {
+        unsafe {
+            let hwnd = HWND(h as _);
+            if !IsWindow(Some(hwnd)).as_bool() {
+                continue;
+            }
+            if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as isize != 0 {
+                continue;
+            }
+            tracing::info!("{h:#x}: 最前面指定が外れていたため付け直す");
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
 }
 
 /// 取り込むウィンドウの Win32 側の付帯情報を記録する
@@ -977,6 +1302,8 @@ fn state_json(state: &State) -> String {
         "active_workspace": active_ws_idx,
         "focused": state.focused.map(|f| f.0),
         "fullscreen": state.fullscreen.map(|f| f.0),
+        "floating": state.floating.iter().map(|f| f.0).collect::<Vec<_>>(),
+        "passive_floats": state.passive_floats.iter().map(|f| f.0).collect::<Vec<_>>(),
         "workspaces": active_workspaces,
         "monitors": monitors_json,
     })
@@ -1486,7 +1813,7 @@ fn state_path() -> PathBuf {
 }
 
 fn persist_restore_rects() {
-    let entries: Vec<serde_json::Value> = {
+    let mut entries: Vec<serde_json::Value> = {
         let guard = RESTORE_RECTS.lock().unwrap_or_else(|p| p.into_inner());
         let Some(map) = guard.as_ref() else { return };
         map.iter()
@@ -1498,6 +1825,10 @@ fn persist_restore_rects() {
             })
             .collect()
     };
+    // フロート窓。kill 後の --restore で枠色・半透明・WM が付けた最前面指定を戻すために残す
+    for &(h, topmost) in FLOATS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        entries.push(serde_json::json!({ "hwnd": h, "floating": true, "topmost": topmost }));
+    }
     let path = state_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1523,6 +1854,26 @@ pub fn restore_from_disk() {
     let (work, _) = primary_monitor_fallback();
     let mut restored = 0;
     for e in &entries {
+        // フロート窓: 位置は動かさず、枠色・半透明・WM が付けた最前面指定だけ戻す
+        if e["floating"].as_bool() == Some(true) {
+            if let Some(h) = e["hwnd"].as_u64() {
+                if unsafe { IsWindow(Some(HWND(h as _))).as_bool() } {
+                    clear_layered(h);
+                    set_border_color(h, BORDER_DEFAULT);
+                    if e["topmost"].as_bool() == Some(true) {
+                        clear_topmost(h);
+                    }
+                }
+            }
+            continue;
+        }
+        // 旧形式: 最前面指定だけの記録
+        if e["topmost"].as_bool() == Some(true) {
+            if let Some(h) = e["hwnd"].as_u64() {
+                clear_topmost(h);
+            }
+            continue;
+        }
         let (Some(h), Some(l), Some(t), Some(r), Some(b)) = (
             e["hwnd"].as_i64(),
             e["left"].as_i64(),
@@ -1592,6 +1943,7 @@ fn install_restore_hooks() {
 fn restore_all() {
     tray::remove();
     uncloak_all();
+    reset_all_floats();
     undim_all();
     let mut guard = RESTORE_RECTS
         .lock()
@@ -1662,5 +2014,172 @@ fn input_binds(cfg: &config::Config) -> events::InputBinds {
         hotkeys: cfg.hotkeys.clone(),
         gestures: cfg.gestures.clone(),
         mouse_scroll_focus: cfg.mouse_scroll_focus,
+    }
+}
+
+/// 管理外の前面ウィンドウがフロート窓として扱えるか (focus-floating の戻り先、
+/// toggle-floating の取り込み対象)。可視・トップレベル・キャプション付きのもの。
+/// 設定ルールは見ない (ルールでフロートにした窓も手動でタイルへ入れられる)。
+fn inspect_tileable(h: isize) -> Option<scan::ScanEntry> {
+    let hwnd = HWND(h as _);
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let e = scan::inspect(hwnd, &[]);
+    tileable_ok(&e).then_some(e)
+}
+
+/// [`inspect_tileable`] の判定部分 (スキャン結果の使い回し用)。
+fn tileable_ok(e: &scan::ScanEntry) -> bool {
+    let caption = emakiwm_core::filter::WS_CAPTION;
+    !matches!(e.decision, Decision::Ignore(_))
+        && e.info.style & caption == caption
+        && e.elevated != Some(true)
+        && unsafe { !IsIconic(HWND(e.hwnd as _)).as_bool() }
+}
+
+/// タイルから外したウィンドウをフロートとして置き直す: 元の大きさ (作業領域の
+/// 8 割まで) で作業領域の中央へ、タイルの上に常に見えるよう最前面にする。
+/// 以後は WM が位置を管理しないので、復元 Rect の記録も手放す。
+fn float_window(h: isize, work: Rect) {
+    let hwnd = HWND(h as _);
+    let original = RESTORE_RECTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(&h));
+    let (w, ht) = match original {
+        Some(r) => (r.right - r.left, r.bottom - r.top),
+        None => (work.w / 2, work.h / 2),
+    };
+    let w = w.min(work.w * 8 / 10);
+    let ht = ht.min(work.h * 8 / 10);
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let we_set_topmost = ex & WS_EX_TOPMOST.0 as isize == 0;
+        let mut floats = FLOATS.lock().unwrap_or_else(|p| p.into_inner());
+        floats.retain(|&(x, _)| x != h as u64);
+        floats.push((h as u64, we_set_topmost));
+        drop(floats);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            work.x + (work.w - w) / 2,
+            work.y + (work.h - ht) / 2,
+            w,
+            ht,
+            SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// フロートの記録を消し、フロート化のときに付けた最前面指定を外す
+/// (元から最前面だった窓には触らない)。
+fn unfloat_window(h: isize) {
+    let mut floats = FLOATS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(i) = floats.iter().position(|&(x, _)| x == h as u64) {
+        let (_, topmost) = floats.swap_remove(i);
+        // 破棄済みの窓には触らない
+        if topmost && unsafe { IsWindow(Some(HWND(h as _))).as_bool() } {
+            clear_topmost(h as u64);
+        }
+    }
+}
+
+/// 破棄されたフロート窓の記録だけを消す (窓がないので何も戻さない)。
+fn forget_float_record(h: u64) {
+    FLOATS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|&(x, _)| x != h);
+}
+
+/// 前面のフロート窓から見て `dir` 側にいちばん近い (可視・非最小化の) フロート窓を返す。
+fn focus_float_in_direction(fg: HWND, dir: FocusDir, state: &State) -> Option<WindowId> {
+    let from = frame_rect(fg.0 as isize)?;
+    let cands: Vec<(WindowId, Rect)> = state
+        .floats()
+        .filter(|f| f.0 != fg.0 as u64)
+        .filter_map(|f| {
+            let hwnd = HWND(f.0 as _);
+            if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+                return None;
+            }
+            frame_rect(f.0 as isize).map(|r| (f, r))
+        })
+        .collect();
+    pick_in_direction(from, dir, &cands)
+}
+
+/// フロート窓を方向キーで 1 ステップ動かす。作業領域の 1/20 ずつ、
+/// 移動後も全モニターの作業領域のいずれかと交差する場合だけ適用する
+/// (別モニターへは渡れるが、完全に画面外へは出さない)。
+fn nudge_float(hwnd: HWND, dir: FocusDir, state: &State) {
+    let mut rc = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rc) }.is_err() {
+        return;
+    }
+    let r = to_rect(rc);
+    let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
+    let work = state
+        .monitors
+        .iter()
+        .map(|m| m.work)
+        .find(|w| cx >= w.x && cx < w.x + w.w && cy >= w.y && cy < w.y + w.h)
+        .unwrap_or(state.monitors[state.active_monitor].work);
+    let moved = nudge_rect(r, dir, work);
+    if !intersects_any(moved, &state.monitors) {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            moved.x,
+            moved.y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// 位置・大きさ・アクティブ状態を変えずに最前面にする。
+fn set_topmost(h: u64) {
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(h as _),
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn clear_topmost(h: u64) {
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(h as _),
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// 終了・レスキュー時: 記録した全フロート窓の枠色を戻し、WM が付けた最前面指定を外す。
+fn reset_all_floats() {
+    let drained = std::mem::take(&mut *FLOATS.lock().unwrap_or_else(|p| p.into_inner()));
+    for (h, topmost) in drained {
+        set_border_color(h, BORDER_DEFAULT);
+        if topmost {
+            clear_topmost(h);
+        }
     }
 }

@@ -16,6 +16,8 @@ commands:
   cycle-width | maximize | fullscreen
   close                       フォーカスウィンドウを閉じる
   toggle-opacity              フォーカスウィンドウの opacity ピンをトグル
+  toggle-floating             前面ウィンドウのフローティング ⇔ タイルを切替
+  focus-floating              フローティングとタイルの間でフォーカスを切替
   spawn <command...>          アプリ起動
   reload                      設定ファイル再読込
   quit                        WM 終了 (全ウィンドウ復元)";

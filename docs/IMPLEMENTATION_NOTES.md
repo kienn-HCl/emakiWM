@@ -225,6 +225,39 @@ Column 内の上下端（または `neighbor` が `None`）に当たった場合
 J/K はワークスペース切替にフォールバックする。
 左右端は停止のまま（ラップしない）。
 
+
+### フローティング窓の装飾と後始末（FR-4.9）
+
+- `State::highlighted()` は「フォーカスされた見た目にすべき窓」を返す。前面がフロート窓
+  (`set_float_foreground` で Foreground イベントごとに通知) ならその窓、そうでなければ
+  タイルの `focused`。DWM 枠色・半透明 (FR-3.8)・太枠 (FR-3.7) はすべてこれを基準にする。
+- フロート窓の太枠は、自由に動くため毎ループ `frame_rect` で実フレームを引いて重ねる。
+  最前面 (TOPMOST) の窓の直後へ挿入したオーバーレイは同じ最前面帯に入るので、
+  Z オーダーで「対象の直下」の方針がそのまま使える。ドラッグ中は追従が遅れるため、
+  `EVENT_SYSTEM_MOVESIZESTART` (`WmEvent::MoveSizeStart`) でそのフロート窓の枠を隠し、
+  `MOVESIZEEND` で戻す。タイルの MoveSizeStart は何もしない。
+- フロート窓は `RESTORE_RECTS` から外れるため、終了時の後始末用に `FLOATS: (hwnd, WM が
+  TOPMOST を付けたか)` を持つ。`restore_all()` は枠色を戻し、WM が付けた TOPMOST だけ外す。
+  `--restore` 用の state ファイルへも `{"hwnd", "floating": true, "topmost"}` で永続化する
+  (旧形式の `{"hwnd", "topmost": true}` も読める)。
+- フロート窓が前面のとき Alt+Shift+H/J/K/L (MoveColumn / MoveToWorkspace) は `nudge_rect` で作業領域の 1/20 ずつ窓を動かし、タイルのレイアウトは触らない。Alt+H / Alt+L (Focus 左右) は `pick_in_direction` (中心点比較で 主軸距離 + 2 * 直交軸距離 が最小の窓) でフロート窓間を移動し、該当がなければ何もしない。 Alt+J / Alt+K (Focus 上下) はワークスペースを切り替え、前面化要求は捨ててフォーカスをフロート窓に残す。
+  移動後にどのモニターの作業領域とも交差しなくなる場合は適用しない。
+- 受動フロート窓: ダイアログ・非リサイズ窓・`action = "float"` のルールの窓など、WM が浮かせた
+  わけではない窓は `State::passive_floats` に記録し、枠色・太枠・半透明・`highlighted()`・
+  キー移動を `toggle-floating` の窓と同様に適用する (`state.floats()` / `is_float()`)。
+  対象は「判定が Float・可視・自プロセス外・WS_CAPTION あり・TOOLWINDOW なし・非最小化」
+  (`passive_float_candidate`)。登録は起動時スキャン・Appeared/MinimizeEnd・非管理窓の
+  Foreground で行い、位置も Z オーダーも触らない。Gone/最小化/cloak で登録を外し装飾を戻す
+  (`toggle-floating` の窓は実際に破棄されたときだけ)。Reload で再評価する。
+  タイルの下へ沈まないよう登録時に位置を変えず TOPMOST を付け (元から TOPMOST なら付けない)、
+  `FLOATS` の WM-set フラグで記録する。登録解除・終了・`--restore` では WM が付けたときだけ外す
+  (破棄済み HWND には触らない)。開いた直後の窓は FOREGROUND が可視化前に届くため、
+  登録時に `GetForegroundWindow()` と照合してフォーカス扱い (`note_float_focus` / `set_float_foreground`) にする。
+  `focus-floating` の候補は 最後に前面だった窓 → toggle-floating 窓 → 受動窓 (いずれも新しい順)。
+- 最前面の維持: アプリが自分で TOPMOST を落とすことがあるため、Foreground のたびに
+  `FLOATS` のうち WM が最前面にした窓 (受動フロート窓を含む) の `WS_EX_TOPMOST` を確認し、外れていれば付け直す
+  (info ログ「最前面指定が外れていたため付け直す」)。
+
 ---
 
 ## 5. 開発環境・ビルド

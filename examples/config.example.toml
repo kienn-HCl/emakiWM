@@ -135,6 +135,13 @@ default_width_ratio = 0.5
 #   fullscreen                  fullscreen トグル (モニタ全面)
 #   close                       フォーカスウィンドウを閉じる
 #   toggle-opacity              フォーカスウィンドウの opacity ピンをトグル
+#   toggle-floating             前面ウィンドウのフローティング ⇔ タイルを切替。フロート化した窓は
+#                               作業領域の中央に最前面で置かれ、以後は自由に動かせる (枠・半透明はタイルと同じ。
+#                               前面のとき move-column left/right と move-window up/down (Alt+Shift+H/L/K/J) はその窓を動かし、
+#                               focus left/right (Alt+H/L) はその方向で最も近いフロート窓へフォーカスを移し、focus up/down (Alt+K/J) は
+#                               フロート窓にフォーカスを残したままワークスペースを切り替える。ダイアログや action = "float" の
+#                               ルールの窓にも枠・半透明・キー移動は効くが、WM が把握しているフロート窓はすべてタイルの上に保たれる)
+#   focus-floating              フローティングウィンドウとタイルの間でフォーカスを切替
 #                               (ピン中は非フォーカスでも pinned_opacity を維持)
 #   focus-monitor left|right    フォーカスを左/右の物理モニタへ移動 (ループ)
 #   move-to-monitor left|right  フォーカスウィンドウを左/右の物理モニタへ移動 (ループ)
@@ -164,6 +171,9 @@ default_width_ratio = 0.5
 #"alt+comma" = "scroll left"
 #"alt+period" = "scroll right"
 #"alt+shift+q" = "close"
+#"alt+shift+space" = "toggle-floating"   # フローティング ⇔ タイル
+#"alt+space" = "focus-floating"          # フローティングとタイルの間でフォーカス切替
+#                                        # (Alt+Space のシステムメニューを上書きする。不要なら "none")
 #"alt+shift+e" = "quit"
 
 # 例: Alt+T に maximize、デフォルトの Alt+Shift+E (quit) を無効化

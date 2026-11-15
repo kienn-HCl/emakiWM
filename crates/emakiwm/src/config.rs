@@ -40,6 +40,8 @@ const DEFAULT_BINDS: &[(&str, &str)] = &[
     ("alt+shift+f", "fullscreen"),
     ("alt+comma", "scroll left"),
     ("alt+period", "scroll right"),
+    ("alt+shift+space", "toggle-floating"),
+    ("alt+space", "focus-floating"),
     ("alt+shift+q", "close"),
     ("alt+shift+e", "quit"),
 ];
