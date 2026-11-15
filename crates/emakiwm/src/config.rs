@@ -10,41 +10,36 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use emakiwm_core::filter::{Rule, RuleAction};
+use emakiwm_core::keybind::resolve_binds;
 use serde::Deserialize;
 
 use crate::events::{parse_command, Hotkey};
 use crate::touchpad::GestureBinds;
 
-// RegisterHotKey の modifier 値 (winuser.h)
-const MOD_ALT: u32 = 0x1;
-const MOD_CONTROL: u32 = 0x2;
-const MOD_SHIFT: u32 = 0x4;
-const MOD_WIN: u32 = 0x8;
-
-/// デフォルトキーバインド (§7)。
+/// デフォルトキーバインド (§7)。`$mod` は [vars] の mod (未設定なら alt) に展開される。
 const DEFAULT_BINDS: &[(&str, &str)] = &[
-    ("alt+h", "focus left"),
-    ("alt+l", "focus right"),
-    ("alt+j", "focus down"),
-    ("alt+k", "focus up"),
-    ("alt+shift+h", "move-column left"),
-    ("alt+shift+l", "move-column right"),
-    ("alt+shift+j", "move-window down"),
-    ("alt+shift+k", "move-window up"),
-    ("alt+u", "workspace down"),
-    ("alt+i", "workspace up"),
-    ("alt+shift+comma", "consume"),
-    ("alt+shift+period", "expel"),
-    ("alt+r", "cycle-width"),
-    ("alt+f", "maximize"),
-    ("alt+shift+f", "fullscreen"),
-    ("alt+comma", "scroll left"),
-    ("alt+period", "scroll right"),
-    ("alt+shift+space", "toggle-floating"),
-    ("alt+space", "focus-floating"),
-    ("alt+o", "toggle-overview"),
-    ("alt+shift+q", "close"),
-    ("alt+shift+e", "quit"),
+    ("$mod+h", "focus left"),
+    ("$mod+l", "focus right"),
+    ("$mod+j", "focus down"),
+    ("$mod+k", "focus up"),
+    ("$mod+shift+h", "move-column left"),
+    ("$mod+shift+l", "move-column right"),
+    ("$mod+shift+j", "move-window down"),
+    ("$mod+shift+k", "move-window up"),
+    ("$mod+u", "workspace down"),
+    ("$mod+i", "workspace up"),
+    ("$mod+shift+comma", "consume"),
+    ("$mod+shift+period", "expel"),
+    ("$mod+r", "cycle-width"),
+    ("$mod+f", "maximize"),
+    ("$mod+shift+f", "fullscreen"),
+    ("$mod+comma", "scroll left"),
+    ("$mod+period", "scroll right"),
+    ("$mod+shift+space", "toggle-floating"),
+    ("$mod+space", "focus-floating"),
+    ("$mod+o", "toggle-overview"),
+    ("$mod+shift+q", "close"),
+    ("$mod+shift+e", "quit"),
 ];
 
 #[derive(Debug, Deserialize, Default)]
@@ -78,6 +73,8 @@ struct ConfigFile {
     /// Overview の縮小率 (FR-4.11)。デフォルト 0.5、範囲 0.1〜0.9
     overview_zoom: Option<f32>,
     rules: Vec<RuleEntry>,
+    /// キー中の `$name` を置換する変数。`mod` は未設定なら "alt"
+    vars: BTreeMap<String, String>,
     keybinds: BTreeMap<String, String>,
     /// 3 本指スワイプの割当 (FR-6.5): "swipe3-up" 等 → コマンド構文。
     /// 空なら Raw Input を購読しない
@@ -177,23 +174,18 @@ pub fn load() -> Config {
         })
         .collect();
 
-    let mut binds: BTreeMap<String, String> = DEFAULT_BINDS
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    for (k, v) in file.keybinds {
-        binds.insert(k.to_lowercase(), v);
+    // 変数展開 → (mods, vk) 単位でデフォルトとマージ (keybind.rs)
+    let (binds, warnings) = resolve_binds(DEFAULT_BINDS, &file.keybinds, &file.vars);
+    for w in warnings {
+        tracing::warn!("{w}");
     }
     let hotkeys = binds
-        .iter()
-        .filter(|(_, v)| !v.is_empty() && v.as_str() != "none")
-        .filter_map(|(k, v)| {
-            let Some((mods, vk)) = parse_key(k) else {
-                tracing::warn!("キー \"{k}\" を解釈できません");
-                return None;
-            };
-            let Some(event) = parse_command(v) else {
-                tracing::warn!("コマンド \"{v}\" を解釈できません (キー {k})");
+        .into_iter()
+        .filter_map(|(mods, vk, cmd)| {
+            let Some(event) = parse_command(&cmd) else {
+                tracing::warn!(
+                    "コマンド \"{cmd}\" を解釈できません (mods={mods:#x}, vk={vk:#04x})"
+                );
                 return None;
             };
             Some(Hotkey { mods, vk, event })
@@ -289,82 +281,9 @@ fn parse_color(s: &str) -> Option<u32> {
     }
 }
 
-/// "alt+shift+h" 形式 → (modifier ビット和, 仮想キーコード)。
-fn parse_key(s: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = s.split('+').map(str::trim).collect();
-    let (key, mod_parts) = parts.split_last()?;
-    let mut mods = 0u32;
-    for m in mod_parts {
-        mods |= match *m {
-            "alt" => MOD_ALT,
-            "ctrl" | "control" => MOD_CONTROL,
-            "shift" => MOD_SHIFT,
-            "win" | "super" => MOD_WIN,
-            _ => return None,
-        };
-    }
-    if mods == 0 {
-        return None; // modifier なしのグローバルキーは奪わない
-    }
-    let vk = match *key {
-        k if k.len() == 1 && k.chars().next()?.is_ascii_alphanumeric() => {
-            k.chars().next()?.to_ascii_uppercase() as u32
-        }
-        "comma" => 0xBC,
-        "period" => 0xBE,
-        "minus" => 0xBD,
-        "slash" => 0xBF,
-        "semicolon" => 0xBA,
-        "space" => 0x20,
-        "enter" | "return" => 0x0D,
-        "tab" => 0x09,
-        "esc" | "escape" => 0x1B,
-        "backspace" => 0x08,
-        "left" => 0x25,
-        "up" => 0x26,
-        "right" => 0x27,
-        "down" => 0x28,
-        "pageup" => 0x21,
-        "pagedown" => 0x22,
-        "home" => 0x24,
-        "end" => 0x23,
-        k if k.starts_with('f') => {
-            let n: u32 = k[1..].parse().ok()?;
-            if !(1..=24).contains(&n) {
-                return None;
-            }
-            0x70 + n - 1
-        }
-        _ => return None,
-    };
-    Some((mods, vk))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_key_basics() {
-        assert_eq!(parse_key("alt+h"), Some((MOD_ALT, 'H' as u32)));
-        assert_eq!(
-            parse_key("alt+shift+comma"),
-            Some((MOD_ALT | MOD_SHIFT, 0xBC))
-        );
-        assert_eq!(
-            parse_key("ctrl+win+f5"),
-            Some((MOD_CONTROL | MOD_WIN, 0x74))
-        );
-        assert_eq!(parse_key("alt+1"), Some((MOD_ALT, '1' as u32)));
-    }
-
-    #[test]
-    fn parse_key_rejects_invalid() {
-        assert_eq!(parse_key("h"), None); // modifier なしは奪わない
-        assert_eq!(parse_key("alt+unknownkey"), None);
-        assert_eq!(parse_key("foo+h"), None);
-        assert_eq!(parse_key("alt+f99"), None);
-    }
 
     /// config.example.toml が実装とずれていないかの検証。
     /// TOML として妥当で、コメント中のデフォルトバインド一覧が
@@ -385,8 +304,12 @@ mod tests {
 
     #[test]
     fn default_binds_all_parse() {
+        let (b, w) = resolve_binds(DEFAULT_BINDS, &BTreeMap::new(), &BTreeMap::new());
+        assert!(w.is_empty(), "{w:?}");
+        // 展開後に衝突して潰れているデフォルトがない
+        assert_eq!(b.len(), DEFAULT_BINDS.len());
         for (key, cmd) in DEFAULT_BINDS {
-            assert!(parse_key(key).is_some(), "key {key} must parse");
+            assert!(b.iter().any(|(_, _, c)| c == cmd), "key {key} must resolve");
             assert!(
                 crate::events::parse_command(cmd).is_some(),
                 "command {cmd} must parse"

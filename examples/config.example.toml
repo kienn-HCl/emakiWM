@@ -118,10 +118,12 @@ default_width_ratio = 0.5
 # キーバインド (FR-6.3)
 # ─────────────────────────────────────────────
 # デフォルト表にマージされる (書いたものだけ上書き)。値を "none" にすると無効化。
+# マージは展開後のキーの組み合わせで行うので、"shift+alt+h" でも "$mod+shift+h" を上書きできる。
 # `emakiwmc reload` で反映される。
 #
 # キー書式: "modifier+...+key" (modifier は必須。修飾なしのキーは奪わない)
-#   modifier : alt / ctrl (control) / shift / win (super)
+#   modifier : alt / ctrl (control) / shift / win (super) / muhenkan (nonconvert, 無変換)
+#              `$mod` のように [vars] の変数も使える (下記)。リテラルの alt+... は mod に追従しない
 #   key      : a-z 0-9 / f1〜f24 / comma period minus slash semicolon /
 #              space enter tab esc backspace /
 #              left right up down pageup pagedown home end
@@ -158,39 +160,55 @@ default_width_ratio = 0.5
 #   reload                      設定ファイル再読込
 #   quit                        emakiwm 終了 (全ウィンドウ復元)
 
+# 変数 (FR-6.2)
+# キーバインドのキー中の `$name` が、ここで定義した値へ文字列として置換される。
+# `$` に続く [A-Za-z0-9_]+ が変数名。未定義の変数を使ったバインドは警告してスキップされる。
+# 値には修飾キーを複数書いてもよい (例: mod = "alt+shift")。
+#
+# `mod` はデフォルトのバインドが使う修飾キーで、未設定なら "alt"。
+# 変えるとデフォルトのバインド全部が付いてくる。"muhenkan" (無変換) も指定できる。
+# 無変換単独で押して離したときは、離した時点で通常どおり IME へ渡る。
+# 無変換を押したまま最後のキー操作から 5 秒たつと、保持は自動で解除される
+# (無変換だけを押し続けている間はリピートで延長されるので解除されない)。
+# 無変換を使うときだけ低レベルキーボードフックを登録する (他の設定では登録しない)。
+# 管理者権限のウィンドウが前面のときは、他のホットキー同様に動かない。
+[vars]
+mod = "alt"
+#mod = "muhenkan"
+
 [keybinds]
 # ↓ デフォルトのキーバインド一覧 (変更したいものだけコメントを外して編集)
-#"alt+h" = "focus left"
-#"alt+l" = "focus right"
-#"alt+j" = "focus down"
-#"alt+k" = "focus up"
-#"alt+shift+h" = "move-column left"
-#"alt+shift+l" = "move-column right"
-#"alt+shift+j" = "move-window down"
-#"alt+shift+k" = "move-window up"
-#"alt+u" = "workspace down"
-#"alt+i" = "workspace up"
-#"alt+shift+comma" = "consume"
-#"alt+shift+period" = "expel"
-#"alt+r" = "cycle-width"
-#"alt+f" = "maximize"
-#"alt+shift+f" = "fullscreen"
-#"alt+comma" = "scroll left"
-#"alt+period" = "scroll right"
-#"alt+shift+q" = "close"
-#"alt+shift+space" = "toggle-floating"   # フローティング ⇔ タイル
-#"alt+space" = "focus-floating"          # フローティングとタイルの間でフォーカス切替
-#"alt+o" = "toggle-overview"             # Overview (全ワークスペースの縮小一覧)
+#"$mod+h" = "focus left"
+#"$mod+l" = "focus right"
+#"$mod+j" = "focus down"
+#"$mod+k" = "focus up"
+#"$mod+shift+h" = "move-column left"
+#"$mod+shift+l" = "move-column right"
+#"$mod+shift+j" = "move-window down"
+#"$mod+shift+k" = "move-window up"
+#"$mod+u" = "workspace down"
+#"$mod+i" = "workspace up"
+#"$mod+shift+comma" = "consume"
+#"$mod+shift+period" = "expel"
+#"$mod+r" = "cycle-width"
+#"$mod+f" = "maximize"
+#"$mod+shift+f" = "fullscreen"
+#"$mod+comma" = "scroll left"
+#"$mod+period" = "scroll right"
+#"$mod+shift+q" = "close"
+#"$mod+shift+space" = "toggle-floating"   # フローティング ⇔ タイル
+#"$mod+space" = "focus-floating"          # フローティングとタイルの間でフォーカス切替
+#"$mod+o" = "toggle-overview"             # Overview (全ワークスペースの縮小一覧)
 #                                        # (Alt+Space のシステムメニューを上書きする。不要なら "none")
-#"alt+shift+e" = "quit"
+#"$mod+shift+e" = "quit"
 
 # 例: Alt+T に maximize、デフォルトの Alt+Shift+E (quit) を無効化
-#"alt+t" = "maximize"
-#"alt+shift+e" = "none"
+#"$mod+t" = "maximize"
+#"$mod+shift+e" = "none"
 
 # 例: アプリ起動 (Alt+Enter でターミナル、Alt+B でブラウザ)
-#"alt+enter" = "spawn wt"
-#"alt+b" = "spawn firefox"
+#"$mod+enter" = "spawn wt"
+#"$mod+b" = "spawn firefox"
 
 # 例: 複数モニター操作 (キーは好みに合わせて変更)
 #"ctrl+alt+l" = "focus-monitor right"    # 右のモニタへフォーカス

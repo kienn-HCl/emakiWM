@@ -8,14 +8,18 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
+use emakiwm_core::keybind::MOD_MUHENKAN;
 use emakiwm_core::layout::FocusDir;
+use emakiwm_core::modkey::{KeyAction, ModKeyTracker, VK_NONCONVERT};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_LMENU, VK_MENU, VK_RMENU,
+    GetAsyncKeyState, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey,
+    HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    MAPVK_VK_TO_VSC, VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetAncestor, GetMessageTime,
@@ -24,8 +28,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, KBDLLHOOKSTRUCT, MSG,
     MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
-    WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_POPUP,
 };
 
 use crate::touchpad::GestureBinds;
@@ -196,6 +200,26 @@ pub fn set_mouse_scroll_focus(enabled: bool) {
 static ALT_DOWN_TICK: AtomicU32 = AtomicU32::new(0);
 static ALT_UP_TICK: AtomicU32 = AtomicU32::new(1);
 
+/// 無変換を修飾にするバインド (mods は MOD_MUHENKAN を含む, vk, イベント)。
+/// apply_binds が差し替え、keyboard_ll_proc が読む。
+static MK_BINDS: Mutex<Vec<(u32, u32, WmEvent)>> = Mutex::new(Vec::new());
+/// 無変換の保持状態機械 (フックスレッドからのみ操作。reload 時に初期化)
+static MK_TRACKER: Mutex<ModKeyTracker> = Mutex::new(ModKeyTracker::new());
+/// 単打再送時に SendInput へ付ける目印 (dwExtraInfo)。
+/// 自分が再送したイベントだけを見分けて素通しする。
+/// 他のキー割当ツールが注入したイベントは通常どおり処理したいので、
+/// LLKHF_INJECTED 全般は除外しない
+const MUHENKAN_REPLAY_TAG: usize = 0x454D_4B4D; // "EMKM"
+/// 無変換単打の再送要求 (フック → フックスレッド自身へ)
+const WM_APP_REPLAY_MUHENKAN: u32 = WM_APP + 2;
+
+/// 登録済みの低レベルフック。一度張ったらプロセス終了まで残す
+#[derive(Default)]
+struct LlHooked {
+    keyboard: bool,
+    mouse: bool,
+}
+
 /// 設定由来の入力割当。reload で差し替えられる。
 pub struct InputBinds {
     pub hotkeys: Vec<Hotkey>,
@@ -223,22 +247,30 @@ pub fn rebind(binds: InputBinds) {
 
 /// 入力割当をフックスレッド上で適用する。`hotkeys` は現在登録中のもので、
 /// 解除してから `binds` のものへ入れ替える。
-/// mouse_scroll_focus が false のときは WH_KEYBOARD_LL / WH_MOUSE_LL を登録しない
+/// WH_KEYBOARD_LL は mouse_scroll_focus か無変換バインドがあるときだけ、WH_MOUSE_LL は
+/// mouse_scroll_focus のときだけ登録する
 /// (不要なグローバルフックはセキュリティソフトの誤検出を招くため)。
 /// gestures も同様に、割当が 1 つもなければ Raw Input を登録しない。
 unsafe fn apply_binds(
     binds: InputBinds,
     hotkeys: &mut Vec<Hotkey>,
-    ll_hooked: &mut bool,
+    hooked: &mut LlHooked,
     events_hwnd: Option<HWND>,
 ) {
-    for i in 0..hotkeys.len() {
-        let _ = UnregisterHotKey(None, (i + 1) as i32);
+    for (i, hk) in hotkeys.iter().enumerate() {
+        if hk.mods & MOD_MUHENKAN == 0 {
+            let _ = UnregisterHotKey(None, (i + 1) as i32);
+        }
     }
     // FR-6.1: ホットキーはメッセージループを持つこのスレッドで登録する。
-    // 失敗 (他アプリと競合等) は警告に留めて続行する
+    // 失敗 (他アプリと競合等) は警告に留めて続行する。
+    // 無変換を含むバインドは RegisterHotKey では扱えないので WH_KEYBOARD_LL 側へ回す。
+    // WM_HOTKEY の id から `hotkeys` を引くため、id は無変換バインドを含む全体の添字 + 1
     const MOD_NOREPEAT: u32 = 0x4000;
     for (i, hk) in binds.hotkeys.iter().enumerate() {
+        if hk.mods & MOD_MUHENKAN != 0 {
+            continue;
+        }
         if let Err(e) = RegisterHotKey(
             None,
             (i + 1) as i32,
@@ -252,6 +284,20 @@ unsafe fn apply_binds(
             );
         }
     }
+    // フックが読む無変換バインドの一覧を差し替える。保持状態も初期化する
+    // (旧割当の添字を引きずらないため)
+    let mk_binds: Vec<(u32, u32, WmEvent)> = binds
+        .hotkeys
+        .iter()
+        .filter(|hk| hk.mods & MOD_MUHENKAN != 0)
+        .map(|hk| (hk.mods, hk.vk, hk.event.clone()))
+        .collect();
+    let any_mk = !mk_binds.is_empty();
+    // 押下状態 (MK_TRACKER) はリセットしない。reload を無変換のコンボに割り当てて
+    // いると、無変換を押したままここに来るため、リセットすると同じ押下中の
+    // 次のコンボやリピートが素のキーとして漏れる。トラッカーはバインドの添字を
+    // 持たない (vk のみ) ので、割当が変わってもそのまま使える
+    *MK_BINDS.lock().unwrap_or_else(|p| p.into_inner()) = mk_binds;
     *hotkeys = binds.hotkeys;
 
     // 3 本指スワイプ (FR-6.5): タッチパッドの Raw Input を events ウィンドウ宛に
@@ -260,13 +306,15 @@ unsafe fn apply_binds(
         crate::touchpad::set_binds(hwnd, binds.gestures);
     }
 
-    // mouse_scroll_focus が有効なときのみグローバル入力フックを登録する。
+    // グローバル入力フックは必要なときだけ登録する (FR-6.1)。
     // WH_KEYBOARD_LL / WH_MOUSE_LL は正当な用途でもセキュリティソフトに
-    // キーロガーとして誤検出されやすいため、必要なときだけ登録する。
-    // 一度登録したフックは無効化後も残すが、MOUSE_SCROLL_FOCUS が false なら素通しする
-    if binds.mouse_scroll_focus && !*ll_hooked {
-        *ll_hooked = true;
-        let instance = GetModuleHandleW(None).unwrap_or_default();
+    // キーロガーとして誤検出されやすいため。
+    //   WH_KEYBOARD_LL: mouse_scroll_focus (Alt 追跡) または無変換バインドがあるとき
+    //   WH_MOUSE_LL:    mouse_scroll_focus のときだけ
+    // 一度登録したフックは無効化後も残すが、機能が無効なら素通しする
+    let instance = GetModuleHandleW(None).unwrap_or_default();
+    if (binds.mouse_scroll_focus || any_mk) && !hooked.keyboard {
+        hooked.keyboard = true;
         match SetWindowsHookExW(
             WH_KEYBOARD_LL,
             Some(keyboard_ll_proc),
@@ -276,6 +324,9 @@ unsafe fn apply_binds(
             Ok(h) if !h.is_invalid() => tracing::debug!("WH_KEYBOARD_LL registered"),
             _ => tracing::warn!("WH_KEYBOARD_LL の登録に失敗しました"),
         }
+    }
+    if binds.mouse_scroll_focus && !hooked.mouse {
+        hooked.mouse = true;
         match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), Some(instance.into()), 0) {
             Ok(h) if !h.is_invalid() => tracing::debug!("WH_MOUSE_LL registered"),
             _ => tracing::warn!("WH_MOUSE_LL の登録に失敗しました"),
@@ -345,8 +396,8 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, binds: InputBinds) {
         crate::overview::create_window();
 
         let mut hotkeys: Vec<Hotkey> = Vec::new();
-        let mut ll_hooked = false;
-        apply_binds(binds, &mut hotkeys, &mut ll_hooked, events_hwnd);
+        let mut hooked = LlHooked::default();
+        apply_binds(binds, &mut hotkeys, &mut hooked, events_hwnd);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -357,9 +408,14 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, binds: InputBinds) {
                     .unwrap_or_else(|p| p.into_inner())
                     .take();
                 if let Some(binds) = pending {
-                    apply_binds(binds, &mut hotkeys, &mut ll_hooked, events_hwnd);
+                    apply_binds(binds, &mut hotkeys, &mut hooked, events_hwnd);
                     tracing::info!("入力割当を更新しました ({} キーバインド)", hotkeys.len());
                 }
+                continue;
+            }
+            // 無変換の単打: フックが食った down/up の代わりに IME へ再送する
+            if msg.message == WM_APP_REPLAY_MUHENKAN && msg.hwnd.is_invalid() {
+                replay_muhenkan_tap();
                 continue;
             }
             if msg.message == WM_HOTKEY {
@@ -374,6 +430,27 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, binds: InputBinds) {
             let _ = DispatchMessageW(&msg);
         }
     });
+}
+
+/// 無変換の down + up を目印つきで注入する。目印によりフックは素通しする
+unsafe fn replay_muhenkan_tap() {
+    let scan = MapVirtualKeyW(VK_NONCONVERT, MAPVK_VK_TO_VSC) as u16;
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(VK_NONCONVERT as u16),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: MUHENKAN_REPLAY_TAG,
+            },
+        },
+    };
+    let inputs = [key(Default::default()), key(KEYEVENTF_KEYUP)];
+    if SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) != inputs.len() as u32 {
+        tracing::warn!("無変換の再送 (SendInput) に失敗しました");
+    }
 }
 
 /// 解像度・作業領域系のブロードキャストを Core へ転送する (FR-5.5)。
@@ -444,22 +521,82 @@ unsafe extern "system" fn win_event_proc(
 /// WH_MOUSE_LL コールバック。Alt+ホイールをフォーカス移動へ変換する。
 /// LowLevelHooksTimeout (既定 ~300ms) 以内に返す必要があるため、
 /// tx.send() のみ行い重い処理は絶対にしない。
-/// WH_KEYBOARD_LL: Alt キーの押下/解放タイムスタンプを記録するだけで
-/// イベントは必ず通過させる (consume しない)。
+/// WH_KEYBOARD_LL: Alt キーの押下/解放タイムスタンプを記録する (mouse_scroll_focus 用。
+/// Alt のイベント自体は食わない)。
 /// キーリピートで SYSKEYDOWN が繰り返し届くため、長押し中は ALT_DOWN_TICK が更新され続ける。
+/// 続けて、無変換バインドがあれば ModKeyTracker で無変換の保持・コンボ発火を処理する。
+/// 重い処理はせず、イベント送信と thread message の post だけを行う。
 unsafe extern "system" fn keyboard_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let ks = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         let vk = ks.vkCode;
+        let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         if vk == VK_MENU.0 as u32 || vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32 {
-            if matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            if down {
                 ALT_DOWN_TICK.store(ks.time, Ordering::Relaxed);
             } else {
                 ALT_UP_TICK.store(ks.time, Ordering::Relaxed);
             }
         }
+        let is_key_event = matches!(
+            wp.0 as u32,
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+        );
+        // 自分が再送した無変換は触らない (他ツールの注入イベントは通常どおり扱う)
+        if is_key_event && ks.dwExtraInfo != MUHENKAN_REPLAY_TAG {
+            if let Some(ret) = handle_muhenkan(vk, down, ks.time) {
+                return ret;
+            }
+        }
     }
     CallNextHookEx(None, code, wp, lp)
+}
+
+/// 無変換バインドの処理。None = 通常どおり次のフックへ渡す。
+unsafe fn handle_muhenkan(vk: u32, down: bool, time: u32) -> Option<LRESULT> {
+    let event;
+    {
+        let binds = MK_BINDS.lock().unwrap_or_else(|p| p.into_inner());
+        if binds.is_empty() {
+            return None; // 無変換バインドなし (reload で無効化済み含む): 素通し
+        }
+        let pressed = |k: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| {
+            GetAsyncKeyState(k.0 as i32) < 0
+        };
+        let mut other_mods = 0;
+        if pressed(VK_SHIFT) {
+            other_mods |= emakiwm_core::keybind::MOD_SHIFT;
+        }
+        if pressed(VK_CONTROL) {
+            other_mods |= emakiwm_core::keybind::MOD_CONTROL;
+        }
+        if pressed(VK_MENU) {
+            other_mods |= emakiwm_core::keybind::MOD_ALT;
+        }
+        if pressed(VK_LWIN) || pressed(VK_RWIN) {
+            other_mods |= emakiwm_core::keybind::MOD_WIN;
+        }
+        let mut tracker = MK_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+        let action = tracker.on_key(vk, down, time, other_mods, |m, k| {
+            binds.iter().position(|(bm, bk, _)| *bm == m && *bk == k)
+        });
+        match action {
+            KeyAction::Pass => return None,
+            KeyAction::Swallow => return Some(LRESULT(1)),
+            KeyAction::ReplayTap => {
+                let tid = HOOK_THREAD_ID.load(Ordering::Relaxed);
+                if tid != 0 {
+                    let _ = PostThreadMessageW(tid, WM_APP_REPLAY_MUHENKAN, WPARAM(0), LPARAM(0));
+                }
+                return Some(LRESULT(1));
+            }
+            KeyAction::Fire(i) => event = binds[i].2.clone(),
+        }
+    }
+    if let Some(tx) = SENDER.get() {
+        let _ = tx.send(event);
+    }
+    Some(LRESULT(1))
 }
 
 /// WH_MOUSE_LL: タイムスタンプ比較で Alt 押下を判定しフォーカス移動へ変換する。
