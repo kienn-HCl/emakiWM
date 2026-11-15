@@ -381,8 +381,10 @@ fn read_reg_sz(hkey: HKEY, name: PCWSTR) -> Option<String> {
     }
     // buf は UTF-16LE バイト列（NUL 終端含む）
     let words: Vec<u16> = buf
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     Some(
         String::from_utf16_lossy(&words)
