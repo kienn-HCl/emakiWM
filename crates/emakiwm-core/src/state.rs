@@ -301,6 +301,55 @@ impl State {
         None
     }
 
+    /// 現在の gap (px)。Overview のシーン計算が `Strip::project` に渡す。
+    pub fn gap(&self) -> i32 {
+        self.gap
+    }
+
+    /// 管理中のウィンドウを OS の前面化イベントを介さずにフォーカスする
+    /// (Overview のクリック選択用)。モニター・ワークスペースを切り替え、
+    /// viewport へ入れる。戻り値: 管理中のウィンドウだったか。
+    pub fn focus_window_by_id(&mut self, id: WindowId) -> bool {
+        let Some(mi) = self.monitor_index_of(id) else {
+            return false;
+        };
+        self.active_monitor = mi;
+        self.float_active = None;
+        let ms = &mut self.monitors[mi];
+        if let Some(si) = ms.stack.strip_index_of(id) {
+            ms.stack.active = si;
+        }
+        self.focused = Some(id);
+        let vw = ms.viewport_w;
+        let strip = ms.stack.active_mut();
+        strip.set_active(id);
+        strip.last_focused = Some(id);
+        strip.ensure_visible(id, vw);
+        true
+    }
+
+    /// 指定モニターのワークスペース `ws` をアクティブにする (Overview の行クリック用)。
+    /// 切替先で最後にフォーカスしていた窓へ戻る (`switch_workspace` と同じ)。
+    /// 範囲外なら何もせず None。戻り値は前面化すべきウィンドウ。
+    pub fn activate_workspace(&mut self, mi: usize, ws: usize) -> Option<WindowId> {
+        let ms = self.monitors.get_mut(mi)?;
+        if ws >= ms.stack.strips.len() {
+            return None;
+        }
+        ms.stack.active = ws;
+        self.active_monitor = mi;
+        self.float_active = None;
+        let strip = ms.stack.active_mut();
+        self.focused = strip
+            .last_focused
+            .filter(|f| strip.contains(*f))
+            .or_else(|| strip.columns.first().and_then(|c| c.active()));
+        if let Some(f) = self.focused {
+            strip.set_active(f);
+        }
+        self.focused
+    }
+
     /// toggle-floating でフロート化されているか。
     pub fn is_floating(&self, id: WindowId) -> bool {
         self.floating.contains(&id)
@@ -1270,5 +1319,83 @@ mod tests {
         let t = s.targets();
         let full = t.iter().find(|(i, _)| *i == w(2)).unwrap().1;
         assert_eq!(full, s.monitors[0].monitor);
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+
+    fn geom(hmonitor: isize, x: i32) -> MonitorGeom {
+        let r = Rect {
+            x,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        MonitorGeom {
+            hmonitor,
+            work: r,
+            monitor: r,
+        }
+    }
+
+    /// 左モニター: ws0 に 1,2 / ws1 に 3。右モニター: 4。フォーカスは 2。
+    fn setup() -> State {
+        let mut s = State::new(&[geom(10, 0), geom(20, 1920)], 8, 0.5);
+        for i in 1..=3 {
+            s.adopt_initial(0, WindowId(i));
+        }
+        s.adopt_initial(1, WindowId(4));
+        s.set_initial_focus(WindowId(3));
+        s.move_to_workspace(true); // 3 を ws1 へ
+        s.switch_workspace(false); // ws0 へ戻る
+        s.focus(FocusDir::Left);
+        s
+    }
+
+    #[test]
+    fn focus_window_by_id_switches_monitor_and_workspace() {
+        let mut s = setup();
+        assert_eq!(s.monitors[0].stack.active, 0);
+        assert!(s.focus_window_by_id(WindowId(3)));
+        assert_eq!(s.focused, Some(WindowId(3)));
+        assert_eq!(s.monitors[0].stack.active, 1);
+        assert!(s.focus_window_by_id(WindowId(4)));
+        assert_eq!(s.active_monitor, 1);
+        assert_eq!(s.highlighted(), Some(WindowId(4)));
+        // フロート前面の見た目は解除される
+        s.set_float_foreground(Some(WindowId(99)));
+        assert!(s.focus_window_by_id(WindowId(1)));
+        assert_eq!(s.highlighted(), Some(WindowId(1)));
+        assert_eq!(s.active_monitor, 0);
+        assert!(!s.focus_window_by_id(WindowId(77)));
+    }
+
+    #[test]
+    fn focus_window_by_id_scrolls_into_view() {
+        let mut s = State::new(&[geom(10, 0)], 8, 0.5);
+        for i in 1..=5 {
+            s.adopt_initial(0, WindowId(i));
+        }
+        assert!(s.focus_window_by_id(WindowId(5)));
+        let t = s.targets();
+        let r = t.iter().find(|(i, _)| *i == WindowId(5)).unwrap().1;
+        assert!(r.x >= 0 && r.x + r.w <= 1920);
+    }
+
+    #[test]
+    fn activate_workspace_restores_last_focused() {
+        let mut s = setup();
+        assert_eq!(s.activate_workspace(0, 1), Some(WindowId(3)));
+        assert_eq!(s.monitors[0].stack.active, 1);
+        assert_eq!(s.focused, Some(WindowId(3)));
+        // 別モニターの行を選ぶとそのモニターがアクティブになる
+        assert_eq!(s.activate_workspace(1, 0), Some(WindowId(4)));
+        assert_eq!(s.active_monitor, 1);
+        // 範囲外は何もしない
+        assert_eq!(s.activate_workspace(0, 99), None);
+        assert_eq!(s.activate_workspace(5, 0), None);
+        assert_eq!(s.active_monitor, 1);
     }
 }

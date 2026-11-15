@@ -42,6 +42,7 @@ const DEFAULT_BINDS: &[(&str, &str)] = &[
     ("alt+period", "scroll right"),
     ("alt+shift+space", "toggle-floating"),
     ("alt+space", "focus-floating"),
+    ("alt+o", "toggle-overview"),
     ("alt+shift+q", "close"),
     ("alt+shift+e", "quit"),
 ];
@@ -74,6 +75,8 @@ struct ConfigFile {
     ws_port: Option<u16>,
     /// Alt+ホイールでフォーカス左右移動。デフォルト false
     mouse_scroll_focus: Option<bool>,
+    /// Overview の縮小率 (FR-4.11)。デフォルト 0.5、範囲 0.1〜0.9
+    overview_zoom: Option<f32>,
     rules: Vec<RuleEntry>,
     keybinds: BTreeMap<String, String>,
     /// 3 本指スワイプの割当 (FR-6.5): "swipe3-up" 等 → コマンド構文。
@@ -115,6 +118,8 @@ pub struct Config {
     pub ws_port: Option<u16>,
     /// Alt+ホイールでフォーカス左右移動。reload で反映
     pub mouse_scroll_focus: bool,
+    /// Overview の縮小率 (0.1〜0.9)。reload で反映
+    pub overview_zoom: f32,
     pub rules: Vec<Rule>,
     pub hotkeys: Vec<Hotkey>,
     /// 3 本指スワイプの割当 (FR-6.5)。全方向 None なら機能無効
@@ -241,6 +246,7 @@ pub fn load() -> Config {
         margin: parse_margin(file.margin.as_deref()),
         ws_port: file.ws_port,
         mouse_scroll_focus: file.mouse_scroll_focus.unwrap_or(false),
+        overview_zoom: file.overview_zoom.unwrap_or(0.5).clamp(0.1, 0.9),
         rules,
         hotkeys,
         gestures,

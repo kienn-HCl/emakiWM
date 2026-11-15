@@ -18,6 +18,8 @@ mod events;
 #[cfg(windows)]
 mod ipc;
 #[cfg(windows)]
+mod overview;
+#[cfg(windows)]
 mod scan;
 #[cfg(windows)]
 mod touchpad;

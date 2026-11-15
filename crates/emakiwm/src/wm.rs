@@ -27,6 +27,10 @@ use std::time::{Duration, Instant};
 use emakiwm_core::anim::{ease_out_cubic, lerp_rect};
 use emakiwm_core::filter::Decision;
 use emakiwm_core::layout::{nudge_rect, pick_in_direction, FocusDir, Rect, WindowId};
+use emakiwm_core::overview::{
+    clip_crop, hit_test, intersect, overview_float, overview_scene, Hit, OverviewScene,
+    OverviewTile,
+};
 use emakiwm_core::state::{Monitor, MonitorGeom, State};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{
@@ -54,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::events::{self, WmEvent};
-use crate::{border, com, config, ipc, scan, tray, ws};
+use crate::{border, com, config, ipc, overview, scan, tray, ws};
 
 /// アニメーション中のフレーム間隔。
 const FRAME: Duration = Duration::from_millis(8);
@@ -121,6 +125,130 @@ struct AnimEntry {
 /// 不可視フレーム (§8-2): GetWindowRect と DWMWA_EXTENDED_FRAME_BOUNDS の差
 /// (left, top, right, bottom)。論理 Rect (見た目のフレーム) ⇔ ウィンドウ Rect の変換に使う。
 type Border = (i32, i32, i32, i32);
+
+/// Overview (FR-4.11) の開閉アニメーション。`Some` の間は Overview ウィンドウが
+/// 出ている (開き切った静止状態を含む)。`t` は 0 (通常) .. 1 (縮小表示)。
+struct OverviewAnim {
+    from: f32,
+    to: f32,
+    started: Instant,
+    /// 補間中か。false なら `to` で静止していて、メインループはポーリングしない
+    running: bool,
+    /// Overview ウィンドウを表示済みか。最初のサムネイル登録を終えてから出すため
+    shown: bool,
+}
+
+impl OverviewAnim {
+    fn opening() -> Self {
+        OverviewAnim {
+            from: 0.0,
+            to: 1.0,
+            started: Instant::now(),
+            running: true,
+            shown: false,
+        }
+    }
+
+    /// 現在の補間位置。duration が 0 なら即座に終点。
+    fn t(&self, dur: Duration) -> f32 {
+        if !self.running {
+            return self.to;
+        }
+        let p = if dur.is_zero() {
+            1.0
+        } else {
+            (self.started.elapsed().as_secs_f32() / dur.as_secs_f32()).min(1.0)
+        };
+        self.from + (self.to - self.from) * p
+    }
+
+    /// 開く/閉じる向きへ切り替える。途中からでも現在位置から折り返す。
+    fn retarget(&mut self, open: bool, dur: Duration) {
+        let to = if open { 1.0 } else { 0.0 };
+        if self.to == to {
+            return;
+        }
+        self.from = self.t(dur);
+        self.to = to;
+        self.started = Instant::now();
+        self.running = true;
+    }
+
+    fn is_closing(&self) -> bool {
+        self.to == 0.0
+    }
+}
+
+/// Overview 1 フレームぶんの描画内容。前回送ったものと比べて差分があるときだけ反映する。
+#[derive(PartialEq)]
+struct OvFrame {
+    items: Vec<overview::Item>,
+    rows: Vec<(Rect, bool)>,
+    highlight: Option<Rect>,
+    ring: u32,
+}
+
+/// 全モニターの `monitor` 領域の外接矩形 (Overview ウィンドウの位置)。
+fn monitors_bounds(monitors: &[Monitor]) -> Rect {
+    let mut it = monitors.iter().map(|m| m.monitor);
+    let first = it.next().unwrap_or_default();
+    it.fold(first, |a, r| {
+        let (x, y) = (a.x.min(r.x), a.y.min(r.y));
+        let (right, bottom) = ((a.x + a.w).max(r.x + r.w), (a.y + a.h).max(r.y + r.h));
+        Rect {
+            x,
+            y,
+            w: right - x,
+            h: bottom - y,
+        }
+    })
+}
+
+/// Overview の 1 フレームを組み立てる。タイル → フロートの順 (後ろほど手前)。
+/// フロート窓は動き得るので、毎回実際のフレームを問い合わせて縮小する。
+/// 返す `OverviewScene` / フロート一覧はクリックの当たり判定に使う。
+fn build_overview(
+    state: &State,
+    cfg: &config::Config,
+    zoom: f32,
+) -> (OvFrame, OverviewScene, Vec<OverviewTile>) {
+    let scene = overview_scene(state, zoom);
+    let mut floats = Vec::new();
+    for fl in state.floats() {
+        let hwnd = HWND(fl.0 as _);
+        if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+            continue;
+        }
+        if let Some(frame) = frame_rect(fl.0 as isize) {
+            floats.push(overview_float(state, fl, frame, zoom));
+        }
+    }
+    let all = || scene.tiles.iter().chain(floats.iter());
+    let items = all()
+        .filter_map(|t| {
+            clip_crop(t.rect, t.clip).map(|(rect, crop)| overview::Item {
+                hwnd: t.id.0,
+                rect,
+                crop,
+            })
+        })
+        .collect();
+    let highlight = state
+        .highlighted()
+        .and_then(|id| all().find(|t| t.id == id))
+        .and_then(|t| intersect(t.rect, t.clip));
+    let ring = border_colors(cfg)
+        .map(|c| c.0)
+        .filter(|c| *c < 0xFFFF_FFFE)
+        .unwrap_or(overview::DEFAULT_RING);
+    let frame = OvFrame {
+        items,
+        rows: scene.rows.iter().map(|r| (r.rect, r.active)).collect(),
+        highlight,
+        ring,
+    };
+    (frame, scene, floats)
+}
 
 pub fn run() {
     // 多重起動の防止: 2 つの WM が同じウィンドウを取り合うと配置が壊れる。
@@ -190,6 +318,10 @@ pub fn run() {
     let mut min_widths: HashMap<u64, i32> = HashMap::new();
     // 今回のレイアウト変化で、要求より広かったために配置し直したウィンドウ
     let mut reapplied: HashSet<u64> = HashSet::new();
+    // Overview (FR-4.11): 開閉状態、前回 Overview へ送った内容、クリック判定用の直近シーン
+    let mut ov: Option<OverviewAnim> = None;
+    let mut ov_sent: Option<OvFrame> = None;
+    let mut ov_hit: Option<(OverviewScene, Vec<OverviewTile>)> = None;
 
     // FR-1.1: 起動時スキャン。モニターごとに左端 x 順に並べてタイル化する
     let (all_initial, initial_others): (Vec<scan::ScanEntry>, Vec<scan::ScanEntry>) =
@@ -251,7 +383,8 @@ pub fn run() {
         // deferred になった uncloak の再試行。残っている間はフレーム間隔で回す
         let pending_uncloak = retry_pending_uncloaks();
         // 起きる必要がある時刻まで待つ。何もなければイベントが来るまでブロックする
-        let timeout = if anim.is_some() || pending_uncloak {
+        let ov_running = ov.as_ref().is_some_and(|o| o.running);
+        let timeout = if anim.is_some() || pending_uncloak || ov_running {
             Some(FRAME)
         } else {
             size_check_at.map(|t| t.saturating_duration_since(Instant::now()))
@@ -357,8 +490,11 @@ pub fn run() {
                 }
                 WmEvent::Foreground(h) => {
                     let id = WindowId(h as u64);
-                    // WM が付けた最前面指定をアプリが落としていたら付け直す
-                    reassert_float_topmost();
+                    // WM が付けた最前面指定をアプリが落としていたら付け直す。
+                    // Overview 中は付け直さない (フロート窓が Overview より手前に出てしまう)
+                    if ov.is_none() {
+                        reassert_float_topmost();
+                    }
                     // 管理外のフロート窓 (ダイアログ・ルールや手動でフロートにした窓) が
                     // 前面になったら、focus-floating の戻り先として覚える
                     if state.monitor_index_of(id).is_none() {
@@ -561,6 +697,46 @@ pub fn run() {
                 }
                 WmEvent::FocusMonitor(forward) => state.focus_monitor(forward),
                 WmEvent::MoveToMonitor(forward) => state.move_to_monitor(forward),
+                WmEvent::ToggleOverview => {
+                    match ov.as_mut() {
+                        // 開いている/開く途中なら閉じ始める。閉じる途中なら開き直す
+                        Some(o) => o.retarget(o.is_closing(), cfg.anim),
+                        None => {
+                            overview::place(monitors_bounds(&state.monitors));
+                            ov = Some(OverviewAnim::opening());
+                        }
+                    }
+                    None
+                }
+                WmEvent::OverviewClose => {
+                    if let Some(o) = ov.as_mut() {
+                        o.retarget(false, cfg.anim);
+                    }
+                    None
+                }
+                WmEvent::OverviewClick(x, y) => {
+                    if let Some(o) = ov.as_mut().filter(|o| !o.is_closing()) {
+                        let hit = ov_hit
+                            .as_ref()
+                            .map_or(Hit::None, |(scene, floats)| hit_test(scene, floats, x, y));
+                        // 選択結果は State へ反映するだけ。実際のフォーカスは閉じ終わりに適用する
+                        match hit {
+                            Hit::Float(id) => {
+                                state.note_float_focus(id);
+                                state.set_float_foreground(Some(id));
+                            }
+                            Hit::Tile(id) => {
+                                state.focus_window_by_id(id);
+                            }
+                            Hit::Row { monitor, workspace } => {
+                                state.activate_workspace(monitor, workspace);
+                            }
+                            Hit::None => {}
+                        }
+                        o.retarget(false, cfg.anim);
+                    }
+                    None
+                }
                 WmEvent::Reload => {
                     cfg = config::load();
                     events::set_mouse_scroll_focus(cfg.mouse_scroll_focus);
@@ -602,11 +778,11 @@ pub fn run() {
                     None
                 }
                 WmEvent::Query(reply) => {
-                    let _ = reply.send(state_json(&state));
+                    let _ = reply.send(state_json(&state, ov.is_some()));
                     None
                 }
                 WmEvent::Subscribe(s) => {
-                    last_state = state_json(&state);
+                    last_state = state_json(&state, ov.is_some());
                     if s.send(last_state.clone()).is_ok() {
                         subscribers.push(s);
                     }
@@ -614,7 +790,9 @@ pub fn run() {
                 }
                 WmEvent::Shutdown => break 'main,
             };
-            if let Some(f) = focus_request {
+            // Overview 中は前面化しない (隠れたアプリへキーボードフォーカスが飛び、
+            // Esc / Enter が Overview に届かなくなる)。閉じ終わりに highlighted() へ適用する
+            if let Some(f) = focus_request.filter(|_| ov.is_none()) {
                 focus_window(f.0 as isize);
             }
 
@@ -653,7 +831,7 @@ pub fn run() {
             }
 
             if !subscribers.is_empty() {
-                let s = state_json(&state);
+                let s = state_json(&state, ov.is_some());
                 if s != last_state {
                     last_state = s;
                     subscribers.retain(|sub| sub.send(last_state.clone()).is_ok());
@@ -784,8 +962,50 @@ pub fn run() {
             }
         }
 
+        // Overview (FR-4.11): 開閉アニメーションを進め、シーンが変わったときだけ
+        // サムネイルを更新する。枠オーバーレイより先に処理する
+        // (閉じ終わった同じ周回で枠を描き戻すため)
+        if let Some(o) = ov.as_mut() {
+            let t = o.t(cfg.anim);
+            if o.running && o.started.elapsed() >= cfg.anim {
+                o.running = false;
+                o.from = o.to;
+            }
+            if !o.running && o.is_closing() {
+                overview::hide();
+                ov = None;
+                ov_sent = None;
+                ov_hit = None;
+                tracing::debug!("overview closed");
+                // 保留していたフォーカスを適用してキーボードフォーカスを返す
+                if let Some(f) = state.highlighted() {
+                    focus_window(f.0 as isize);
+                }
+                if !subscribers.is_empty() {
+                    let s = state_json(&state, false);
+                    if s != last_state {
+                        last_state = s;
+                        subscribers.retain(|sub| sub.send(last_state.clone()).is_ok());
+                    }
+                }
+            } else {
+                let zoom = 1.0 + (cfg.overview_zoom - 1.0) * ease_out_cubic(t);
+                let (frame, scene, floats) = build_overview(&state, &cfg, zoom);
+                ov_hit = Some((scene, floats));
+                if ov_sent.as_ref() != Some(&frame) {
+                    overview::update(&frame.items, &frame.rows, frame.highlight, frame.ring);
+                    ov_sent = Some(frame);
+                }
+                if !o.shown {
+                    o.shown = true;
+                    overview::show();
+                    tracing::debug!("overview opened");
+                }
+            }
+        }
+
         // FR-3.7: 太枠オーバーレイ
-        if cfg.border_thickness > 0 && border_colors(&cfg).is_some() {
+        if ov.is_none() && cfg.border_thickness > 0 && border_colors(&cfg).is_some() {
             let (fc, uc) = border_colors(&cfg).unwrap();
             let mut items = Vec::new();
             for &(h, _) in &last_targets {
@@ -852,6 +1072,7 @@ pub fn run() {
     }
 
     tracing::info!("shutting down, restoring windows");
+    overview::hide();
     restore_all();
 }
 
@@ -1253,7 +1474,7 @@ fn close_target(state: &State) -> Option<isize> {
 }
 
 /// IPC `state` 応答の JSON (FR-7.3)。マルチモニター情報を含む。
-fn state_json(state: &State) -> String {
+fn state_json(state: &State, overview: bool) -> String {
     let monitors = &state.monitors;
     let active_monitor = state.active_monitor;
     let monitors_json: Vec<_> = monitors
@@ -1302,6 +1523,7 @@ fn state_json(state: &State) -> String {
         "active_workspace": active_ws_idx,
         "focused": state.focused.map(|f| f.0),
         "fullscreen": state.fullscreen.map(|f| f.0),
+        "overview": overview,
         "floating": state.floating.iter().map(|f| f.0).collect::<Vec<_>>(),
         "passive_floats": state.passive_floats.iter().map(|f| f.0).collect::<Vec<_>>(),
         "workspaces": active_workspaces,
@@ -1310,7 +1532,7 @@ fn state_json(state: &State) -> String {
     .to_string()
 }
 
-fn focus_window(h: isize) {
+pub(crate) fn focus_window(h: isize) {
     // cloak 中のウィンドウを前面化する前に解除する (この時点の位置は
     // 全モニター外の退避先なので、解除しても画面には写らない)
     if cloaked_by_us(h as u64) {
@@ -1721,7 +1943,7 @@ fn read_back_sizes(
 }
 
 /// 不可視フレーム (§8-2) を現在の状態から測る。DPI が変わると太さも変わる。
-fn measure_border(h: isize) -> Option<Border> {
+pub(crate) fn measure_border(h: isize) -> Option<Border> {
     let frame = frame_rect(h)?;
     let mut rect = RECT::default();
     unsafe { GetWindowRect(HWND(h as _), &mut rect).ok()? };

@@ -17,6 +17,7 @@ commands:
   close                       フォーカスウィンドウを閉じる
   toggle-opacity              フォーカスウィンドウの opacity ピンをトグル
   toggle-floating             前面ウィンドウのフローティング ⇔ タイルを切替
+  toggle-overview             Overview (全ワークスペースの縮小一覧) を開閉
   focus-floating              フローティングとタイルの間でフォーカスを切替
   spawn <command...>          アプリ起動
   reload                      設定ファイル再読込

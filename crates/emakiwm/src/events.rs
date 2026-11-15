@@ -83,6 +83,12 @@ pub enum WmEvent {
     FocusMonitor(bool),
     /// フォーカスウィンドウを隣のモニタへ移動する。true = 右/次
     MoveToMonitor(bool),
+    /// Overview (全ワークスペースの縮小一覧) の開閉トグル (FR-4.11)
+    ToggleOverview,
+    /// Overview を閉じる要求 (Overview ウィンドウでの Esc / Enter)
+    OverviewClose,
+    /// Overview ウィンドウ上のクリック (スクリーン座標)
+    OverviewClick(i32, i32),
     /// 設定ファイルの再読込 (FR-7.2)
     Reload,
     /// 解像度・タスクバー等の変更 (WM_DISPLAYCHANGE / WM_SETTINGCHANGE)。
@@ -144,6 +150,7 @@ pub fn parse_command(s: &str) -> Option<WmEvent> {
         ("focus-monitor", "left") => WmEvent::FocusMonitor(false),
         ("move-to-monitor", "right") => WmEvent::MoveToMonitor(true),
         ("move-to-monitor", "left") => WmEvent::MoveToMonitor(false),
+        ("toggle-overview", "") => WmEvent::ToggleOverview,
         ("reload", "") => WmEvent::Reload,
         ("quit", "") => WmEvent::Shutdown,
         _ => return None,
@@ -332,6 +339,10 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, binds: InputBinds) {
                 events_hwnd = Some(hwnd);
             }
         }
+
+        // Overview 用ウィンドウ (FR-4.11)。マウス・キー入力を受けるため、
+        // メッセージポンプを持つこのスレッドが所有する
+        crate::overview::create_window();
 
         let mut hotkeys: Vec<Hotkey> = Vec::new();
         let mut ll_hooked = false;
