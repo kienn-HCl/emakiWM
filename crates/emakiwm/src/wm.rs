@@ -133,12 +133,7 @@ pub fn run() {
     events::set_mouse_scroll_focus(cfg.mouse_scroll_focus);
 
     let (tx, rx) = mpsc::channel::<WmEvent>();
-    events::spawn_hook_thread(
-        tx.clone(),
-        cfg.hotkeys.clone(),
-        cfg.mouse_scroll_focus,
-        cfg.gestures.clone(),
-    );
+    events::spawn_hook_thread(tx.clone(), input_binds(&cfg));
     if let Some(port) = cfg.ws_port {
         ws::spawn_ws_thread(port, tx.clone());
     }
@@ -412,6 +407,7 @@ pub fn run() {
                 WmEvent::Reload => {
                     cfg = config::load();
                     events::set_mouse_scroll_focus(cfg.mouse_scroll_focus);
+                    events::rebind(input_binds(&cfg));
                     state.reconfigure(&monitor_geoms(&cfg), cfg.gap, cfg.default_ratio);
                     if !cfg.cloak {
                         uncloak_all();
@@ -423,7 +419,7 @@ pub fn run() {
                     }
                     bordered = None;
                     tracing::info!(
-                        "config reloaded: gap={} anim={:?} rules={} cloak={} (キーバインド・ジェスチャ変更は再起動が必要)",
+                        "config reloaded: gap={} anim={:?} rules={} cloak={}",
                         cfg.gap,
                         cfg.anim,
                         cfg.rules.len(),
@@ -1529,6 +1525,9 @@ fn install_restore_hooks() {
     std::panic::set_hook(Box::new(move |info| {
         restore_all();
         default_hook(info);
+        // 復元後は状態を失っているので動き続けない。IPC 等の補助スレッドの
+        // panic でも同じ (ウィンドウだけ戻して WM が居座るのを防ぐ)
+        std::process::exit(101);
     }));
 
     unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
@@ -1577,9 +1576,10 @@ fn restore_all() {
 }
 
 fn shell_spawn(cmd: &str) {
-    let mut parts = cmd.split_whitespace();
-    let Some(prog) = parts.next() else { return };
-    let args: String = parts.collect::<Vec<_>>().join(" ");
+    let Some((prog, args)) = emakiwm_core::cmdline::split_program(cmd) else {
+        tracing::warn!("spawn \"{cmd}\" を解釈できません (引用符が閉じていない等)");
+        return;
+    };
 
     let prog_w: Vec<u16> = prog.encode_utf16().chain(std::iter::once(0)).collect();
     let args_w: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1606,5 +1606,14 @@ fn shell_spawn(cmd: &str) {
             "spawn \"{cmd}\" failed (ShellExecuteW={})",
             result.0 as isize
         );
+    }
+}
+
+/// 設定から入力割当 (キーバインド・ジェスチャ・Alt+ホイール) を取り出す。
+fn input_binds(cfg: &config::Config) -> events::InputBinds {
+    events::InputBinds {
+        hotkeys: cfg.hotkeys.clone(),
+        gestures: cfg.gestures.clone(),
+        mouse_scroll_focus: cfg.mouse_scroll_focus,
     }
 }

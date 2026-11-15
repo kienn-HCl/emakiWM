@@ -63,7 +63,7 @@ Windows 向けのスクロール型タイリングウィンドウマネージャ
 
 `%USERPROFILE%\.config\emakiwm\config.toml` に配置。ファイルがなければデフォルトで起動します。
 
-設定を変えたら `emakiwmc reload` で即時反映（キーバインドとジェスチャの変更のみ再起動が必要）。
+設定を変えたら `emakiwmc reload` で即時反映されます（キーバインド・ジェスチャを含む。`ws_port` と `startup` のみ再起動が必要）。
 
 設定例: [`examples/config.example.toml`](examples/config.example.toml)
 
@@ -80,7 +80,7 @@ startup = ["zebar"]
 
 ### タッチパッドジェスチャ
 
-Precision Touchpad の 3 本指スワイプに任意のコマンドを割り当てられます（反映には再起動が必要）:
+Precision Touchpad の 3 本指スワイプに任意のコマンドを割り当てられます:
 
 ```toml
 [gestures]

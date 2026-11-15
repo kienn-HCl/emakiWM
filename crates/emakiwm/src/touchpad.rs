@@ -79,9 +79,19 @@ struct State {
 /// static に置くため Mutex で包む (競合は実質発生しない)。
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
+/// 割当を差し替える (起動時・reload 時)。未登録で割当があれば Raw Input を登録する。
+/// 割当が空になっても登録は解除しない (空の割当では何も発火しない)。
+pub fn set_binds(hwnd: HWND, binds: GestureBinds) {
+    match STATE.get() {
+        Some(state) => state.lock().unwrap_or_else(|p| p.into_inner()).binds = binds,
+        None if !binds.is_empty() => register(hwnd, binds),
+        None => {}
+    }
+}
+
 /// タッチパッドの Raw Input を hwnd 宛に登録する。
 /// RIDEV_INPUTSINK で非フォアグラウンドでも受け取る (WM は前面を持たないため)。
-pub fn register(hwnd: HWND, binds: GestureBinds) {
+fn register(hwnd: HWND, binds: GestureBinds) {
     let rid = RAWINPUTDEVICE {
         usUsagePage: PAGE_DIGITIZER,
         usUsage: USAGE_TOUCHPAD,

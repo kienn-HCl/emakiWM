@@ -3,7 +3,7 @@
 //! 場所: `%USERPROFILE%\.config\emakiwm\config.toml`。
 //! ファイルがない・壊れている場合はデフォルトへフォールバックする (起動を止めない)。
 //! キーバインドはデフォルト表へのマージ (値を "none" にすると無効化)。
-//! 注意: キーバインドの反映には再起動が必要。gap / anim_ms / rules / hide はホットリロード可。
+//! ws_port と startup 以外は reload で反映される (キーバインド・ジェスチャを含む)。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -75,7 +75,7 @@ struct ConfigFile {
     rules: Vec<RuleEntry>,
     keybinds: BTreeMap<String, String>,
     /// 3 本指スワイプの割当 (FR-6.5): "swipe3-up" 等 → コマンド構文。
-    /// 空なら Raw Input を購読しない。反映には再起動が必要
+    /// 空なら Raw Input を購読しない
     gestures: BTreeMap<String, String>,
 }
 

@@ -122,6 +122,6 @@ fn handle(cmd: &str, tx: &Sender<WmEvent>) -> String {
             let _ = tx.send(ev);
             r#"{"ok":true}"#.into()
         }
-        None => format!(r#"{{"error":"unknown command: {cmd}"}}"#),
+        None => serde_json::json!({ "error": format!("unknown command: {cmd}") }).to_string(),
     }
 }

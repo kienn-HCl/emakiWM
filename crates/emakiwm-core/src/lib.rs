@@ -5,7 +5,9 @@
 //! (REQUIREMENTS.md §10 テスト戦略)。
 
 pub mod anim;
+pub mod cmdline;
 pub mod filter;
 pub mod gesture;
 pub mod layout;
+pub mod origin;
 pub mod state;

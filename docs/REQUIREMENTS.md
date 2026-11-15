@@ -111,14 +111,14 @@ komorebi / GlazeWM と同様に **外部プロセスから既存ウィンドウ�
 - FR-6.5 タッチパッドの 3 本指スワイプ (Precision Touchpad) に任意コマンドを割当可能
   - Raw Input (HID Usage 0x0D:0x05) を直接解析し、OS のジェスチャ設定に依存しない
   - 設定 `[gestures]` の `swipe3-up/down/left/right` (値はキーバインドと同じコマンド構文)。未設定なら Raw Input を購読しない
-  - 制約: OS 側の 3 本指ジェスチャ設定と併用すると二重反応するため、OS 側を「なし」にする手順を README で案内する。反映には再起動が必要
+  - 制約: OS 側の 3 本指ジェスチャ設定と併用すると二重反応するため、OS 側を「なし」にする手順を README で案内する
 
 ### FR-7 設定・IPC
 - FR-7.1 設定ファイル: TOML。場所は `%USERPROFILE%\.config\emakiwm\config.toml`
-- FR-7.2 設定ファイルのホットリロード (ファイル監視 or リロードコマンド)
+- FR-7.2 設定ファイルのホットリロード (リロードコマンド)。キーバインド・ジェスチャも再起動なしで反映する
 - FR-7.3 名前付きパイプによる IPC サーバーを持ち、CLI (`emakiwmc`) から全操作・状態取得 (JSON) ができる
 - FR-7.4 状態取得 API はステータスバー連携 (Zebar / yasb 等) を想定した購読 (subscribe) モードを持つ
-- FR-7.5 webview 系バー (Zebar) 向けに WebSocket (`ws_port`、localhost のみ) でも購読と同じ state JSON を配信する。サンプルウィジェットを examples/zebar/ に同梱
+- FR-7.5 webview 系バー (Zebar) 向けに WebSocket (`ws_port`、localhost のみ) でも購読と同じ state JSON を配信する。ブラウザ上の外部サイトから読まれないよう Origin がループバック以外の http(s) の接続は拒否する。サンプルウィジェットを examples/zebar/ に同梱
 
 ## 4. 非機能要件
 
@@ -126,7 +126,7 @@ komorebi / GlazeWM と同様に **外部プロセスから既存ウィンドウ�
 - NFR-2 アイドル時 CPU 使用率 ≈ 0% (ポーリング禁止、完全イベント駆動)
 - NFR-3 メモリ常駐 50MB 以下
 - NFR-4 クラッシュ耐性: panic ハンドラで FR-1.5 のウィンドウ復元を必ず実行する。強制終了に備え FR-1.6 の永続化 + `--restore` も提供する
-- NFR-5 単一実行ファイル配布 (emakiwm.exe + emakiwmc.exe)。インストーラ不要
+- NFR-5 実行ファイル単体で動作する (emakiwm.exe + emakiwmc.exe)。配置・PATH・自動起動の登録は任意のインストーラ (emakiwm-setup.exe) で行える
 - NFR-6 ログ: `tracing` クレートで構造化ログ。`--verbose` でイベントダンプ
 
 ## 5. アーキテクチャ
@@ -164,7 +164,7 @@ struct State {
 struct Monitor {
     handle: HMONITOR,
     work_area: Rect,      // 物理px
-    workspace: Workspace, // v2 で Vec<Workspace>
+    stack: Stack,         // 縦に並ぶ Workspace 列 (FR-5.4)
 }
 struct Workspace {
     columns: Vec<Column>,
@@ -191,7 +191,7 @@ struct Tile {
 | イベント購読 | `SetWinEventHook` (WINEVENT_OUTOFCONTEXT) |
 | 配置 | `BeginDeferWindowPos` / `DeferWindowPos` / `EndDeferWindowPos` |
 | 実フレーム取得 | `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` ※下記 8.2 |
-| cloak | `DwmSetWindowAttribute(DWMWA_CLOAK)` (非公開寄り、要検証) |
+| cloak | 非公開シェル COM `IApplicationView::SetCloak` + `WS_EX_TOOLWINDOW` (FR-3.3。`DWMWA_CLOAK` は他プロセスに使えない) |
 | フォーカス | `SetForegroundWindow` + `AllowSetForegroundWindow` 対策 |
 | モニタ | `EnumDisplayMonitors`, `GetMonitorInfoW`, `GetDpiForMonitor` |
 | ホットキー | `RegisterHotKey` |

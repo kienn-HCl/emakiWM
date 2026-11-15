@@ -49,11 +49,24 @@ fn client(mut stream: TcpStream, tx: Sender<WmEvent>) -> std::io::Result<()> {
         }
     }
     let req = String::from_utf8_lossy(&buf);
-    let Some(key) = req.lines().find_map(|l| {
-        let (name, v) = l.split_once(':')?;
-        name.eq_ignore_ascii_case("sec-websocket-key")
-            .then(|| v.trim().to_string())
-    }) else {
+    let header = |wanted: &str| {
+        req.lines().find_map(|l| {
+            let (name, v) = l.split_once(':')?;
+            name.eq_ignore_ascii_case(wanted)
+                .then(|| v.trim().to_string())
+        })
+    };
+    // ブラウザで開いた外部サイトからの接続を拒否する (状態にはウィンドウタイトルが含まれる)
+    let origin = header("origin");
+    if !emakiwm_core::origin::origin_allowed(origin.as_deref()) {
+        tracing::warn!(
+            "WebSocket: Origin {:?} からの接続を拒否しました (ループバック以外の Web ページ)",
+            origin.as_deref().unwrap_or("")
+        );
+        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        return Ok(());
+    }
+    let Some(key) = header("sec-websocket-key") else {
         let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
         return Ok(());
     };

@@ -6,24 +6,26 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use emakiwm_core::layout::FocusDir;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, HOT_KEY_MODIFIERS, VK_LMENU, VK_MENU, VK_RMENU,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_LMENU, VK_MENU, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetAncestor, GetMessageTime,
-    GetMessageW, RegisterClassW, SetWindowsHookExW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY,
-    EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
-    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT,
-    WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
+    GetMessageW, PostThreadMessageW, RegisterClassW, SetWindowsHookExW, EVENT_OBJECT_CLOAKED,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, GA_ROOT, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
+    WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETTINGCHANGE,
+    WM_SYSKEYDOWN, WNDCLASSW, WS_POPUP,
 };
 
 use crate::touchpad::GestureBinds;
@@ -178,21 +180,102 @@ pub fn set_mouse_scroll_focus(enabled: bool) {
 static ALT_DOWN_TICK: AtomicU32 = AtomicU32::new(0);
 static ALT_UP_TICK: AtomicU32 = AtomicU32::new(1);
 
-/// フックスレッドを起動する。プロセス終了までフックは張りっぱなしでよい
-/// (フックはプロセス終了時に OS が解除する)。
-/// キーバインドの変更はプロセス再起動が必要 (フックスレッドで登録するため)。
+/// 設定由来の入力割当。reload で差し替えられる。
+pub struct InputBinds {
+    pub hotkeys: Vec<Hotkey>,
+    pub gestures: GestureBinds,
+    pub mouse_scroll_focus: bool,
+}
+
+/// フックスレッドの ID と、差し替え待ちの入力割当。
+/// ホットキーは登録したスレッドのメッセージキューに届くため、
+/// 差し替えもフックスレッド上で行う必要がある。
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static PENDING_BINDS: Mutex<Option<InputBinds>> = Mutex::new(None);
+const WM_APP_REBIND: u32 = WM_APP + 1;
+
+/// 入力割当の差し替えをフックスレッドへ依頼する (reload 用、FR-7.2)。
+pub fn rebind(binds: InputBinds) {
+    *PENDING_BINDS.lock().unwrap_or_else(|p| p.into_inner()) = Some(binds);
+    let tid = HOOK_THREAD_ID.load(Ordering::Relaxed);
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, WM_APP_REBIND, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// 入力割当をフックスレッド上で適用する。`hotkeys` は現在登録中のもので、
+/// 解除してから `binds` のものへ入れ替える。
 /// mouse_scroll_focus が false のときは WH_KEYBOARD_LL / WH_MOUSE_LL を登録しない
 /// (不要なグローバルフックはセキュリティソフトの誤検出を招くため)。
 /// gestures も同様に、割当が 1 つもなければ Raw Input を登録しない。
-pub fn spawn_hook_thread(
-    tx: Sender<WmEvent>,
-    hotkeys: Vec<Hotkey>,
-    mouse_scroll_focus: bool,
-    gestures: GestureBinds,
+unsafe fn apply_binds(
+    binds: InputBinds,
+    hotkeys: &mut Vec<Hotkey>,
+    ll_hooked: &mut bool,
+    events_hwnd: Option<HWND>,
 ) {
+    for i in 0..hotkeys.len() {
+        let _ = UnregisterHotKey(None, (i + 1) as i32);
+    }
+    // FR-6.1: ホットキーはメッセージループを持つこのスレッドで登録する。
+    // 失敗 (他アプリと競合等) は警告に留めて続行する
+    const MOD_NOREPEAT: u32 = 0x4000;
+    for (i, hk) in binds.hotkeys.iter().enumerate() {
+        if let Err(e) = RegisterHotKey(
+            None,
+            (i + 1) as i32,
+            HOT_KEY_MODIFIERS(hk.mods | MOD_NOREPEAT),
+            hk.vk,
+        ) {
+            tracing::warn!(
+                "RegisterHotKey(mods={:#x}, vk={:#04x}) failed: {e}",
+                hk.mods,
+                hk.vk
+            );
+        }
+    }
+    *hotkeys = binds.hotkeys;
+
+    // 3 本指スワイプ (FR-6.5): タッチパッドの Raw Input を events ウィンドウ宛に
+    // 登録する。割当がなければ購読自体しない
+    if let Some(hwnd) = events_hwnd {
+        crate::touchpad::set_binds(hwnd, binds.gestures);
+    }
+
+    // mouse_scroll_focus が有効なときのみグローバル入力フックを登録する。
+    // WH_KEYBOARD_LL / WH_MOUSE_LL は正当な用途でもセキュリティソフトに
+    // キーロガーとして誤検出されやすいため、必要なときだけ登録する。
+    // 一度登録したフックは無効化後も残すが、MOUSE_SCROLL_FOCUS が false なら素通しする
+    if binds.mouse_scroll_focus && !*ll_hooked {
+        *ll_hooked = true;
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        match SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(keyboard_ll_proc),
+            Some(instance.into()),
+            0,
+        ) {
+            Ok(h) if !h.is_invalid() => tracing::debug!("WH_KEYBOARD_LL registered"),
+            _ => tracing::warn!("WH_KEYBOARD_LL の登録に失敗しました"),
+        }
+        match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), Some(instance.into()), 0) {
+            Ok(h) if !h.is_invalid() => tracing::debug!("WH_MOUSE_LL registered"),
+            _ => tracing::warn!("WH_MOUSE_LL の登録に失敗しました"),
+        }
+    }
+}
+
+/// フックスレッドを起動する。プロセス終了までフックは張りっぱなしでよい
+/// (フックはプロセス終了時に OS が解除する)。
+/// 入力割当は [`rebind`] で起動後も差し替えられる。
+pub fn spawn_hook_thread(tx: Sender<WmEvent>, binds: InputBinds) {
     SENDER.set(tx).expect("hook thread spawned twice");
 
     std::thread::spawn(move || unsafe {
+        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
+
         // 必要レンジのみフックする (全イベント購読は高コスト):
         //   0x0003..0x0017: FOREGROUND / MOVESIZEEND / MINIMIZESTART / MINIMIZEEND
         //   0x8001..0x8003: DESTROY / SHOW / HIDE
@@ -220,6 +303,7 @@ pub fn spawn_hook_thread(
             lpszClassName: w!("emakiwm_events"),
             ..Default::default()
         };
+        let mut events_hwnd = None;
         if RegisterClassW(&wc) != 0 {
             if let Ok(hwnd) = CreateWindowExW(
                 Default::default(),
@@ -236,53 +320,28 @@ pub fn spawn_hook_thread(
                 None,
             ) {
                 crate::tray::setup(hwnd);
-                // 3 本指スワイプ (FR-6.5): タッチパッドの Raw Input をこの
-                // ウィンドウ宛に登録する。割当がなければ購読自体しない
-                if !gestures.is_empty() {
-                    crate::touchpad::register(hwnd, gestures);
-                }
+                events_hwnd = Some(hwnd);
             }
         }
 
-        // FR-6.1: ホットキーはメッセージループを持つこのスレッドで登録する。
-        // 失敗 (他アプリと競合等) は警告に留めて続行する
-        const MOD_NOREPEAT: u32 = 0x4000;
-        for (i, hk) in hotkeys.iter().enumerate() {
-            if let Err(e) = RegisterHotKey(
-                None,
-                (i + 1) as i32,
-                HOT_KEY_MODIFIERS(hk.mods | MOD_NOREPEAT),
-                hk.vk,
-            ) {
-                tracing::warn!(
-                    "RegisterHotKey(mods={:#x}, vk={:#04x}) failed: {e}",
-                    hk.mods,
-                    hk.vk
-                );
-            }
-        }
-
-        // mouse_scroll_focus が有効なときのみグローバル入力フックを登録する。
-        // WH_KEYBOARD_LL / WH_MOUSE_LL は正当な用途でもセキュリティソフトに
-        // キーロガーとして誤検出されやすいため、必要なときだけ登録する。
-        if mouse_scroll_focus {
-            match SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(keyboard_ll_proc),
-                Some(instance.into()),
-                0,
-            ) {
-                Ok(h) if !h.is_invalid() => tracing::debug!("WH_KEYBOARD_LL registered"),
-                _ => tracing::warn!("WH_KEYBOARD_LL の登録に失敗しました"),
-            }
-            match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), Some(instance.into()), 0) {
-                Ok(h) if !h.is_invalid() => tracing::debug!("WH_MOUSE_LL registered"),
-                _ => tracing::warn!("WH_MOUSE_LL の登録に失敗しました"),
-            }
-        }
+        let mut hotkeys: Vec<Hotkey> = Vec::new();
+        let mut ll_hooked = false;
+        apply_binds(binds, &mut hotkeys, &mut ll_hooked, events_hwnd);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // reload による入力割当の差し替え (スレッド宛メッセージなので hwnd は NULL)
+            if msg.message == WM_APP_REBIND && msg.hwnd.is_invalid() {
+                let pending = PENDING_BINDS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
+                if let Some(binds) = pending {
+                    apply_binds(binds, &mut hotkeys, &mut ll_hooked, events_hwnd);
+                    tracing::info!("入力割当を更新しました ({} キーバインド)", hotkeys.len());
+                }
+                continue;
+            }
             if msg.message == WM_HOTKEY {
                 let pressed = msg.wParam.0;
                 if let Some(hk) = pressed.checked_sub(1).and_then(|i| hotkeys.get(i)) {
