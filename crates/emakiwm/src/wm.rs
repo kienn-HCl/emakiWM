@@ -17,7 +17,7 @@
 //! 射影 (targets) への補間。イベントで論理状態が変われば、進行中のアニメは
 //! 現在の visual から新ターゲットへ向け直される (§8-8)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -46,10 +46,10 @@ use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurr
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetForegroundWindow,
-    GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsZoomed, PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    SetWindowPos, GWL_EXSTYLE, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, WM_CLOSE,
-    WS_EX_LAYERED,
+    GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsZoomed, PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
+    SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_SHOWDEFAULT, WM_CLOSE, WS_EX_LAYERED,
 };
 
 use crate::events::{self, WmEvent};
@@ -180,6 +180,8 @@ pub fn run() {
     let mut size_check_at: Option<Instant> = None;
     // 読み戻しで判明したウィンドウごとの最小幅 (FR-3.6)
     let mut min_widths: HashMap<u64, i32> = HashMap::new();
+    // 今回のレイアウト変化で、要求より広かったために配置し直したウィンドウ
+    let mut reapplied: HashSet<u64> = HashSet::new();
 
     // FR-1.1: 起動時スキャン。モニターごとに左端 x 順に並べてタイル化する
     let all_initial: Vec<scan::ScanEntry> = {
@@ -461,6 +463,7 @@ pub fn run() {
             let new_targets = targets(&state);
             if new_targets != last_targets || resnap {
                 size_checks_done = 0;
+                reapplied.clear();
                 size_check_at = None;
                 last_targets = new_targets;
                 anim = start_transition(
@@ -556,7 +559,14 @@ pub fn run() {
                 .get(size_checks_done)
                 .map(|ms| Instant::now() + Duration::from_millis(*ms));
             size_checks_done += 1;
-            if read_back_sizes(&mut state, &last_targets, &own_map, &mut min_widths) {
+            if read_back_sizes(
+                &mut state,
+                &last_targets,
+                &own_map,
+                &mut min_widths,
+                &mut borders,
+                &mut reapplied,
+            ) {
                 last_targets = targets(&state);
                 anim = start_transition(
                     &mut visual,
@@ -1326,16 +1336,27 @@ fn set_toolwindow(h: u64, on: bool) {
     }
 }
 
-/// 可視ウィンドウの実フレーム幅を読み、要求幅より広いものは Column 幅を
-/// 実幅へ広げ、その幅を最小幅として `min_widths` に記録する (FR-3.6)。
+/// 配置後の実フレームを目標と突き合わせる (FR-3.6, §8-6)。
+///
+/// - ずれていたら不可視フレームを測り直して配置し直す。DPI の異なるモニターへ
+///   移した直後は、アプリが WM_DPICHANGED に応じて自分でリサイズしてこちらの
+///   配置を上書きするため (不可視フレームの太さも DPI で変わる)
+/// - 配置し直しても要求より広いままなら最小サイズ制約とみなし、Column 幅を
+///   実幅へ広げて `min_widths` に記録する
+///
+/// `reapplied` は今回のレイアウト変化で「広すぎる」ために配置し直したウィンドウ。
 /// 戻り値: 広げた Column があるか。
 fn read_back_sizes(
     state: &mut State,
     targets: &[(u64, Rect)],
     own_map: &HashMap<u64, usize>,
     min_widths: &mut HashMap<u64, i32>,
+    borders: &mut HashMap<u64, Border>,
+    reapplied: &mut HashSet<u64>,
 ) -> bool {
+    let off = |a: i32, b: i32| (a - b).abs() > SIZE_TOLERANCE;
     let mut grown = false;
+    let mut retry: Vec<(u64, Rect)> = Vec::new();
     for &(h, r) in targets {
         if state.fullscreen == Some(WindowId(h))
             || hide_level(h, r, own_map, &state.monitors) != Hide::Show
@@ -1346,17 +1367,43 @@ fn read_back_sizes(
         let Some(actual) = frame_rect(h as isize) else {
             continue;
         };
-        if actual.w > r.w + SIZE_TOLERANCE && state.grow_column(WindowId(h), actual.w) {
-            tracing::info!(
-                "{h:#x}: 最小サイズ制約により列幅を {} → {} へ",
-                r.w,
-                actual.w
-            );
-            grown = true;
-            min_widths.insert(h, actual.w);
+        let wider = actual.w > r.w + SIZE_TOLERANCE;
+        // 一度配置し直しても広いまま → 最小サイズ制約
+        if wider && !reapplied.insert(h) {
+            if state.grow_column(WindowId(h), actual.w) {
+                tracing::info!(
+                    "{h:#x}: 最小サイズ制約により列幅を {} → {} へ",
+                    r.w,
+                    actual.w
+                );
+                grown = true;
+                min_widths.insert(h, actual.w);
+            }
+            continue;
+        }
+        if off(actual.x, r.x) || off(actual.y, r.y) || off(actual.w, r.w) || off(actual.h, r.h) {
+            tracing::debug!("{h:#x}: 実フレーム {actual:?} が目標 {r:?} と違うため配置し直す");
+            if let Some(b) = measure_border(h as isize) {
+                borders.insert(h, b);
+            }
+            retry.push((h, r));
         }
     }
+    apply_rects(&retry, borders);
     grown
+}
+
+/// 不可視フレーム (§8-2) を現在の状態から測る。DPI が変わると太さも変わる。
+fn measure_border(h: isize) -> Option<Border> {
+    let frame = frame_rect(h)?;
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(HWND(h as _), &mut rect).ok()? };
+    Some((
+        frame.x - rect.left,
+        frame.y - rect.top,
+        rect.right - (frame.x + frame.w),
+        rect.bottom - (frame.y + frame.h),
+    ))
 }
 
 /// 見た目のフレーム (DWMWA_EXTENDED_FRAME_BOUNDS) の現在位置。
