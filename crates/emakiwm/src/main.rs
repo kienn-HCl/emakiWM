@@ -10,15 +10,25 @@ mod autostart;
 #[cfg(windows)]
 mod border;
 #[cfg(windows)]
+mod cloak;
+#[cfg(windows)]
 mod com;
 #[cfg(windows)]
 mod config;
 #[cfg(windows)]
+mod decor;
+#[cfg(windows)]
 mod events;
+#[cfg(windows)]
+mod floats;
 #[cfg(windows)]
 mod ipc;
 #[cfg(windows)]
+mod ovctl;
+#[cfg(windows)]
 mod overview;
+#[cfg(windows)]
+mod restore;
 #[cfg(windows)]
 mod scan;
 #[cfg(windows)]
@@ -65,12 +75,12 @@ fn main() {
         }
         if restore {
             // FR-1.6: 強制終了後のレスキュー。state.json の位置へ戻す
-            wm::restore_from_disk();
+            restore::restore_from_disk();
             return;
         }
         // レスキュー: cloak されたまま取り残されたウィンドウの一括解除
         if args.iter().any(|a| a == "--uncloak-all") {
-            wm::uncloak_all_leftovers();
+            restore::uncloak_all_leftovers();
             return;
         }
         // スタートアップ自動起動の登録・解除 (--autostart on|off)
@@ -93,7 +103,7 @@ fn main() {
             let on = args.get(i + 2).map(String::as_str) != Some("off");
             match hwnd {
                 Some(h) => {
-                    wm::shell_cloak(h as u64, on);
+                    cloak::shell_cloak(h as u64, on);
                     println!("cloak({on}) + toolwindow({on}) applied to {h:#x}");
                 }
                 None => eprintln!("usage: emakiwm --cloak <hex-hwnd> [on|off]"),

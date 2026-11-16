@@ -78,6 +78,46 @@ pub struct Removal {
     pub rolled_back: bool,
 }
 
+/// シェルが観測した、受動フロート窓の登録判断に要る事実。
+/// Win32 への問い合わせ結果だけを持ち、判断は [`State`] が行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatFacts {
+    /// 受動フロート窓の条件を満たすか (ルール判定が Float・可視・キャプション付き・
+    /// 最小化されていない等。シェルが窓の現在の状態から判定する)
+    pub candidate: bool,
+    /// 観測した時点でこの窓が前面か
+    pub foreground: bool,
+}
+
+/// 前面になった管理外の窓をシェルが調べた結果 ([`State::float_foreground`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundProbe {
+    /// フロート窓として扱える窓か (focus-floating の戻り先にできるか)。
+    /// 受動フロートの条件より緩い (ルールで Float でない通常窓も含む)
+    pub tileable: bool,
+    pub facts: FloatFacts,
+}
+
+/// [`State::float_gone`] の結果。シェルは種別に応じた後始末をする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatGone {
+    /// フロート窓として記録していない、または記録を残す状況 (最小化された toggle-floating 窓)
+    Kept,
+    /// toggle-floating 済みの窓が破棄された (記録を消した)
+    UserFloat,
+    /// 受動フロート窓の登録を外した
+    Passive,
+}
+
+/// [`State::sync_passive_floats`] の結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FloatSync {
+    /// もう該当しないため登録を外した窓
+    pub dropped: Vec<WindowId>,
+    /// 新たに登録した窓
+    pub added: Vec<WindowId>,
+}
+
 /// WM 全体の論理状態。
 /// 不変条件: `monitors` は空にならず、`active_monitor` は常に有効な添字。
 #[derive(Debug, Clone)]
@@ -381,6 +421,86 @@ impl State {
             return;
         }
         self.passive_floats.push(id);
+    }
+
+    /// 受動フロート窓の登録を判断する (窓の出現・最小化解除・設定再読み込み時)。
+    /// タイル・フロート済みの窓、`candidate` でない窓は登録しない。登録したら true。
+    ///
+    /// 開いた直後の窓は FOREGROUND イベントが可視化前に届き、フロートとして認識できない
+    /// まま取り逃がす。そのため登録時点で前面なら、ここでフォーカスされた窓として扱う
+    /// (強調と focus-floating の戻り先)。
+    pub fn register_passive_float(&mut self, id: WindowId, facts: FloatFacts) -> bool {
+        if self.is_float(id) || self.monitor_index_of(id).is_some() || !facts.candidate {
+            return false;
+        }
+        self.add_passive_float(id);
+        if facts.foreground {
+            self.note_float_focus(id);
+            self.set_float_foreground(Some(id));
+        }
+        true
+    }
+
+    /// 前面ウィンドウの変化のうちフロート窓に関わる部分。管理外の窓が前面になったら
+    /// focus-floating の戻り先として覚え、フロート窓として未登録なら登録を試みる。
+    /// 最後に、フロート窓が前面ならそちらを「フォーカスされた見た目」にする。
+    ///
+    /// `probe`: 窓を調べる (Win32 への問い合わせ)。管理外で未登録の窓のときだけ呼ばれる。
+    /// 窓が無効なら None。新たに登録したら true。
+    pub fn float_foreground(
+        &mut self,
+        id: WindowId,
+        probe: impl FnOnce() -> Option<ForegroundProbe>,
+    ) -> bool {
+        let mut registered = false;
+        if self.monitor_index_of(id).is_none() {
+            if self.is_float(id) {
+                self.note_float_focus(id);
+            } else if let Some(p) = probe() {
+                if p.tileable {
+                    self.note_float_focus(id);
+                }
+                registered = self.register_passive_float(id, p.facts);
+            }
+        }
+        self.set_float_foreground(self.is_float(id).then_some(id));
+        registered
+    }
+
+    /// タイルではない窓が消えた・非表示になった・最小化された・別デスクトップへ行ったとき。
+    /// `destroyed`: 窓が破棄されたか。
+    ///
+    /// toggle-floating 済みの窓は破棄されたときだけ記録を消す (最小化では残し、復帰を待つ)。
+    /// 受動フロート窓は理由を問わず登録を外す (再表示されれば出現時に再登録される)。
+    pub fn float_gone(&mut self, id: WindowId, destroyed: bool) -> FloatGone {
+        if self.is_floating(id) && destroyed {
+            self.forget_floating(id);
+            FloatGone::UserFloat
+        } else if self.passive_floats.contains(&id) {
+            self.forget_floating(id);
+            FloatGone::Passive
+        } else {
+            FloatGone::Kept
+        }
+    }
+
+    /// 受動フロート窓の集合をスキャン結果へ合わせる (起動時・設定の再読み込み時)。
+    /// もう該当しない窓は登録を外し、新たに該当する窓を登録する。
+    pub fn sync_passive_floats(&mut self, scanned: &[(WindowId, FloatFacts)]) -> FloatSync {
+        let mut sync = FloatSync::default();
+        for id in self.passive_floats.clone() {
+            let still = scanned.iter().any(|(s, f)| *s == id && f.candidate);
+            if !still {
+                self.forget_floating(id);
+                sync.dropped.push(id);
+            }
+        }
+        for &(id, facts) in scanned {
+            if self.register_passive_float(id, facts) {
+                sync.added.push(id);
+            }
+        }
+        sync
     }
 
     /// toggle-floating 済み、または受動的なフロート窓か。
@@ -1179,6 +1299,156 @@ mod tests {
         // タイルが 1 つもなければ戻り先なし
         s.remove(w(3), 0);
         assert_eq!(s.focus_toggle_candidates(false), []);
+    }
+
+    fn facts(candidate: bool, foreground: bool) -> FloatFacts {
+        FloatFacts {
+            candidate,
+            foreground,
+        }
+    }
+
+    fn probe(tileable: bool, f: FloatFacts) -> Option<ForegroundProbe> {
+        Some(ForegroundProbe { tileable, facts: f })
+    }
+
+    #[test]
+    fn foreground_before_window_qualifies_then_appeared_registers_and_highlights() {
+        let mut s = two_monitors();
+        // 新しいダイアログ: FOREGROUND が可視化前に届く。まだ候補ではないので登録されないが、
+        // focus-floating の戻り先としては覚える
+        assert!(!s.float_foreground(w(50), || probe(true, facts(false, true))));
+        assert!(!s.is_float(w(50)));
+        assert_eq!(s.highlighted(), s.focused);
+        assert_eq!(s.focus_toggle_candidates(true), [w(50)]);
+        // 続く Appeared (可視化後) で登録され、そのまま強調される
+        assert!(s.register_passive_float(w(50), facts(true, true)));
+        assert!(s.is_float(w(50)) && !s.is_floating(w(50)));
+        assert_eq!(s.highlighted(), Some(w(50)));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50)]);
+        // 二重登録はしない
+        assert!(!s.register_passive_float(w(50), facts(true, true)));
+        assert_eq!(s.passive_floats, [w(50)]);
+    }
+
+    #[test]
+    fn appeared_without_foreground_registers_but_does_not_steal_highlight() {
+        let mut s = two_monitors();
+        assert!(s.register_passive_float(w(50), facts(true, false)));
+        assert_eq!(s.highlighted(), s.focused);
+        // 候補でない窓・タイル・toggle-floating 済みは登録しない
+        assert!(!s.register_passive_float(w(51), facts(false, true)));
+        assert!(!s.register_passive_float(w(1), facts(true, true)));
+        s.float(w(2), 0);
+        assert!(!s.register_passive_float(w(2), facts(true, true)));
+        assert_eq!(s.passive_floats, [w(50)]);
+    }
+
+    #[test]
+    fn float_foreground_registers_and_highlights_in_one_event() {
+        let mut s = two_monitors();
+        // 既に可視の候補が前面になった: 登録・MRU・強調が 1 回で済む
+        assert!(s.float_foreground(w(50), || probe(true, facts(true, true))));
+        assert_eq!(s.highlighted(), Some(w(50)));
+        // 登録済みの窓は調べない (probe を呼ばない)
+        assert!(!s.float_foreground(w(50), || panic!("登録済みは調べない")));
+        assert_eq!(s.highlighted(), Some(w(50)));
+        // タイルが前面になれば強調はタイルへ戻り、タイルも調べない
+        assert!(!s.float_foreground(w(1), || panic!("タイルは調べない")));
+        assert_eq!(s.highlighted(), s.focused);
+        // 窓が無効 (probe が None) なら何も覚えない
+        assert!(!s.float_foreground(w(60), || None));
+        assert!(!s.is_float(w(60)));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50)]);
+    }
+
+    #[test]
+    fn user_float_survives_minimize_but_passive_float_is_forgotten() {
+        let mut s = two_monitors();
+        s.float(w(1), 0);
+        s.register_passive_float(w(50), facts(true, true));
+        // 最小化・非表示 (破棄ではない): toggle-floating 済みは残し、受動は外す
+        assert_eq!(s.float_gone(w(1), false), FloatGone::Kept);
+        assert!(s.is_floating(w(1)));
+        assert_eq!(s.float_gone(w(50), false), FloatGone::Passive);
+        assert!(!s.is_float(w(50)));
+        assert_eq!(s.highlighted(), s.focused);
+        assert_eq!(s.focus_toggle_candidates(true), [w(1)]);
+        // 破棄されたら toggle-floating 済みも忘れる
+        assert_eq!(s.float_gone(w(1), true), FloatGone::UserFloat);
+        assert!(!s.is_float(w(1)));
+        assert_eq!(s.focus_toggle_candidates(true), []);
+        // 受動は破棄でも同じ。再表示されれば再登録できる
+        s.register_passive_float(w(50), facts(true, false));
+        assert_eq!(s.float_gone(w(50), true), FloatGone::Passive);
+        assert!(s.register_passive_float(w(50), facts(true, false)));
+        // 記録のない窓は何もしない
+        assert_eq!(s.float_gone(w(99), true), FloatGone::Kept);
+    }
+
+    #[test]
+    fn toggling_passive_float_into_tile_cleans_float_state() {
+        let mut s = two_monitors();
+        s.register_passive_float(w(50), facts(true, true));
+        assert_eq!(s.highlighted(), Some(w(50)));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50)]);
+        // toggle-floating で前面の受動フロートをタイルへ取り込む
+        assert_eq!(s.unfloat(w(50)), Some(w(50)));
+        assert!(s.monitor_index_of(w(50)).is_some());
+        assert!(!s.is_float(w(50)));
+        assert!(s.passive_floats.is_empty());
+        // 強調・focus-floating の戻り先からも消えている
+        assert_eq!(s.highlighted(), s.focused);
+        assert_eq!(s.focus_toggle_candidates(true), []);
+        // タイル化した窓は受動フロートとして再登録されない
+        assert!(!s.register_passive_float(w(50), facts(true, true)));
+    }
+
+    #[test]
+    fn focus_toggle_lists_passive_floats_in_mru_order_after_user_floats() {
+        let mut s = two_monitors();
+        s.float(w(1), 0);
+        for h in [50, 51, 52] {
+            assert!(s.register_passive_float(w(h), facts(true, false)));
+        }
+        // 前面記録なし: toggle-floating 済み → 受動 (新しい順)
+        assert_eq!(s.focus_toggle_candidates(true), [w(1), w(52), w(51), w(50)]);
+        // 前面になった受動窓は MRU の先頭へ。最後に前面だった窓が最優先
+        s.float_foreground(w(50), || panic!("登録済みは調べない"));
+        assert_eq!(s.focus_toggle_candidates(true), [w(50), w(1), w(52), w(51)]);
+        s.float_foreground(w(51), || panic!("登録済みは調べない"));
+        assert_eq!(s.focus_toggle_candidates(true), [w(51), w(1), w(50), w(52)]);
+        // フロート窓からはタイル側のフォーカスへ戻る
+        assert_eq!(s.focus_toggle_candidates(false), [w(2)]);
+    }
+
+    #[test]
+    fn reload_sync_drops_floats_that_no_longer_qualify() {
+        let mut s = two_monitors();
+        s.float(w(1), 0);
+        s.register_passive_float(w(50), facts(true, false));
+        s.register_passive_float(w(51), facts(true, true));
+        s.register_passive_float(w(52), facts(true, false));
+        assert_eq!(s.highlighted(), Some(w(51)));
+        // 50 は継続、51 はルール変更で外れ、52 は窓が消え、53 が新たに該当
+        let scanned = [
+            (w(50), facts(true, false)),
+            (w(51), facts(false, true)),
+            (w(53), facts(true, false)),
+            // タイル・toggle-floating 済みは受動にしない
+            (w(2), facts(true, false)),
+            (w(1), facts(true, false)),
+        ];
+        let sync = s.sync_passive_floats(&scanned);
+        assert_eq!(sync.dropped, [w(51), w(52)]);
+        assert_eq!(sync.added, [w(53)]);
+        assert_eq!(s.passive_floats, [w(50), w(53)]);
+        // 外れた窓の強調・戻り先は消える
+        assert_eq!(s.highlighted(), s.focused);
+        assert!(!s.focus_toggle_candidates(true).contains(&w(51)));
+        // 変化がなければ空
+        let again = [(w(50), facts(true, false)), (w(53), facts(true, false))];
+        assert_eq!(s.sync_passive_floats(&again), FloatSync::default());
     }
 
     #[test]
