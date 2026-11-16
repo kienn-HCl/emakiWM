@@ -1269,6 +1269,15 @@ pub(crate) fn focus_window(h: isize) {
         if SetForegroundWindow(hwnd).as_bool() {
             return;
         }
+        // フォアグラウンドロック対策: Windows は「最後に入力を受けたプロセス」にだけ
+        // 前面化を許す。無変換バインド (低レベルフック経由) や IPC からの操作では
+        // その条件を満たさず失敗するため、移動量 0 のマウス入力を自分で送ってから再試行する
+        // (画面上は何も起きない)。失敗したまま枠と半透明だけが移ると、見た目と
+        // キー入力先が食い違う
+        send_null_input();
+        if SetForegroundWindow(hwnd).as_bool() {
+            return;
+        }
         let fg = GetForegroundWindow();
         let fg_tid = GetWindowThreadProcessId(fg, None);
         let our_tid = GetCurrentThreadId();
@@ -1553,4 +1562,27 @@ fn monitor_of(state: &State, h: u64) -> Option<isize> {
     state
         .monitor_index_of(WindowId(h))
         .map(|mi| state.monitors[mi].hmonitor)
+}
+
+/// 前面化の許可を得るための、画面上は何も起こさない入力 (移動量 0 のマウス移動)。
+fn send_null_input() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
 }
