@@ -135,56 +135,69 @@ komorebi / GlazeWM と同様に **外部プロセスから既存ウィンドウ�
 ## 5. アーキテクチャ
 
 ```
-┌────────────────────────────────────────────────────────┐
-│ emakiwm.exe                                            │
-│                                                        │
-│  [Win32 スレッド]                                       │
-│   ├ メッセージループ (RegisterHotKey, WM_DISPLAYCHANGE) │
-│   └ SetWinEventHook コールバック                        │
-│        ↓ Event enum を mpsc チャネルへ送信              │
-│  [Core スレッド]                                        │
-│   ├ State: Vec<Monitor> → Vec<Workspace> → Strip       │
-│   ├ reducer: (State, Event) -> (State, Vec<Cmd>)       │
-│   │   ※ 純粋関数として実装し単体テスト可能にする        │
-│   └ animator: offset_x 補間タイマー                     │
-│        ↓ Cmd                                           │
-│  [Renderer]                                            │
-│   ├ DeferWindowPos バッチ適用                           │
-│   ├ cloak / uncloak                                    │
-│   └ 自己発生イベントの抑制 (下記 8.1 参照)              │
-│  [IPC スレッド] 名前付きパイプ \\.\pipe\emakiwm         │
-└────────────────────────────────────────────────────────┘
-   emakiwmc.exe (CLI) ──JSON──▶ IPC
+┌──────────────────────────────────────────────────────────────┐
+│ emakiwm.exe                                                  │
+│                                                              │
+│  [フックスレッド] events.rs (メッセージループを持つ)           │
+│   ├ SetWinEventHook (出現・消滅・前面化・最小化・移動終了など) │
+│   ├ RegisterHotKey / 無変換バインド用 WH_KEYBOARD_LL           │
+│   ├ 不可視ウィンドウ: WM_DISPLAYCHANGE・タスクトレイ・          │
+│   │   タッチパッド Raw Input                                  │
+│   └ overview ウィンドウ (入力を受けるのでこのスレッドが所有)    │
+│        ↓ WmEvent を mpsc チャネルへ送信                       │
+│  [Core スレッド] wm.rs の Runtime                              │
+│   ├ emakiwm_core::state::State  ← 論理状態と状態遷移 (純粋関数) │
+│   │     モニター → ワークスペース (Stack) → Strip → Column     │
+│   │     フォーカス・フロート窓・fullscreen                     │
+│   ├ 配置とアニメーション (visual → targets の補間、DeferWindowPos)│
+│   ├ 実サイズの読み戻し (最小サイズ制約・DPI 変更)               │
+│   ├ cloak.rs / decor.rs / floats.rs (隠蔽・枠と半透明・フロート) │
+│   └ ovctl.rs (overview の開閉と DWM サムネイルの更新)           │
+│  [IPC スレッド] 名前付きパイプ \\.\pipe\emakiwm (接続ごとに 1 本)│
+│  [WebSocket スレッド] ws_port 設定時のみ (状態の配信)          │
+└──────────────────────────────────────────────────────────────┘
+   emakiwmc.exe (CLI) ──コマンド / JSON──▶ IPC
 ```
 
-### 5.1 状態モデル (Rust スケッチ)
+- 状態遷移は `emakiwm-core` の `State` が持ち、Linux の `cargo test` で検証する。Core スレッドは OS への問い合わせ結果を `State` に渡し、戻り値 (前面化すべきウィンドウ等) に従って Win32 の副作用を実行するだけにする。
+- 1 回のループの副作用の順序は `wm.rs` 冒頭のコメントに記載する (cloak と TOOLWINDOW の順序など、入れ替えると壊れるものがあるため)。
+- 終了時の復元 (`restore.rs` の `restore_all`) は panic フックと Ctrl ハンドラ (別スレッド) からも呼ばれる。触る状態は static に置き、この経路に新しいロックを足さない。
+
+### 5.1 状態モデル (emakiwm-core)
 
 ```rust
 struct State {
     monitors: Vec<Monitor>,
-    focused: Option<WindowId>,
+    active_monitor: usize,
+    focused: Option<WindowId>,        // タイル側のフォーカス
+    fullscreen: Option<WindowId>,
+    floating: Vec<WindowId>,          // toggle-floating で浮かせた窓
+    passive_floats: Vec<WindowId>,    // ダイアログ・ルールで float の窓
+    // float_active / float_focus: 前面・最後に前面だったフロート窓
 }
 struct Monitor {
-    handle: HMONITOR,
-    work_area: Rect,      // 物理px
-    stack: Stack,         // 縦に並ぶ Workspace 列 (FR-5.4)
+    hmonitor: isize,
+    work: Rect,           // margin 適用後の作業領域 (物理 px)
+    monitor: Rect,        // モニター全面 (fullscreen 用)
+    viewport_w: i32,
+    stack: Stack,         // 縦に並ぶワークスペース列 (FR-5.4)
 }
-struct Workspace {
+struct Stack { strips: Vec<Strip>, active: usize }  // 末尾に常に空の Strip が 1 つ
+struct Strip {
     columns: Vec<Column>,
     offset_x: i32,        // Viewport 左端の Strip 座標
-    anim: Option<ScrollAnim>,
+    last_focused: Option<WindowId>,
 }
 struct Column {
     x: i32,               // Strip 座標
-    width: ColumnWidth,   // Proportion(f32) | Fixed(i32)
-    tiles: Vec<Tile>,
-}
-struct Tile {
-    hwnd: HWND,
-    state: TileState,     // Managed | Untracked | Fullscreen
-    restore_rect: Rect,   // WM 終了時の復元用
+    width: i32,           // px。viewport 幅が変わると比率を保って引き直す
+    tiles: Vec<WindowId>,
+    active_tile: usize,
+    saved_width: Option<i32>,  // maximize 中の元の幅
 }
 ```
+
+HWND は `WindowId(u64)` として抽象化し、復元 Rect・不可視フレーム・cloak / 半透明の実状態などの Win32 固有の情報は shell 側 (`crates/emakiwm`) が持つ。
 
 ### 5.2 主要 Win32 API
 
