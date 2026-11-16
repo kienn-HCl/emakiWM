@@ -29,7 +29,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "emakiwm"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "emakiwm-core",
  "embed-manifest",
@@ -46,14 +46,14 @@ dependencies = [
 
 [[package]]
 name = "emakiwm-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "emakiwm-setup"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "embed-manifest",
  "embed-resource",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "emakiwmc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "embed-resource",
 ]
