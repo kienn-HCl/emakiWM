@@ -17,17 +17,17 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey,
-    HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MAPVK_VK_TO_VSC, VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, HOT_KEY_MODIFIERS, INPUT,
+    INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VK_CONTROL, VK_LMENU,
+    VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetAncestor, GetMessageTime,
     GetMessageW, PostThreadMessageW, RegisterClassW, SetWindowsHookExW, EVENT_OBJECT_CLOAKED,
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, KBDLLHOOKSTRUCT, MSG,
-    MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
+    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+    MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
     WM_MOUSEWHEEL, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_POPUP,
 };
@@ -231,6 +231,9 @@ pub struct InputBinds {
 /// ホットキーは登録したスレッドのメッセージキューに届くため、
 /// 差し替えもフックスレッド上で行う必要がある。
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+/// 無変換キーのスキャンコード (JIS キーボード。キーボードレイアウトに依らない)
+const MUHENKAN_SCAN: u32 = 0x7B;
 static PENDING_BINDS: Mutex<Option<InputBinds>> = Mutex::new(None);
 const WM_APP_REBIND: u32 = WM_APP + 1;
 
@@ -434,20 +437,26 @@ pub fn spawn_hook_thread(tx: Sender<WmEvent>, binds: InputBinds) {
 
 /// 無変換の down + up を目印つきで注入する。目印によりフックは素通しする
 unsafe fn replay_muhenkan_tap() {
-    let scan = MapVirtualKeyW(VK_NONCONVERT, MAPVK_VK_TO_VSC) as u16;
-    let key = |flags| INPUT {
+    // スキャンコードで送り、仮想キーへの変換は現在のキーボードレイアウトに任せる。
+    // US レイアウトでは無変換キーが VK_NONCONVERT にならないため、VK で送ると
+    // 押したキーと違うキーとして IME に届いてしまう
+    let key = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(VK_NONCONVERT as u16),
-                wScan: scan,
-                dwFlags: flags,
+                wVk: Default::default(),
+                wScan: MUHENKAN_SCAN as u16,
+                dwFlags: if up {
+                    KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+                } else {
+                    KEYEVENTF_SCANCODE
+                },
                 time: 0,
                 dwExtraInfo: MUHENKAN_REPLAY_TAG,
             },
         },
     };
-    let inputs = [key(Default::default()), key(KEYEVENTF_KEYUP)];
+    let inputs = [key(false), key(true)];
     if SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) != inputs.len() as u32 {
         tracing::warn!("無変換の再送 (SendInput) に失敗しました");
     }
@@ -529,7 +538,13 @@ unsafe extern "system" fn win_event_proc(
 unsafe extern "system" fn keyboard_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let ks = &*(lp.0 as *const KBDLLHOOKSTRUCT);
-        let vk = ks.vkCode;
+        // 無変換キーはレイアウトによって仮想キーが変わる (JP: VK_NONCONVERT、US: 別の値)。
+        // スキャンコードはレイアウトに依らないので、そちらでも無変換と判定する
+        let vk = if ks.scanCode == MUHENKAN_SCAN && !ks.flags.contains(LLKHF_EXTENDED) {
+            VK_NONCONVERT
+        } else {
+            ks.vkCode
+        };
         let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         if vk == VK_MENU.0 as u32 || vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32 {
             if down {
